@@ -112,6 +112,10 @@ func (r *RuleManager) Start(ctx context.Context) error {
 		r.logger.Error("error cleaning up rules", zap.Error(err))
 	}
 
+	// Perform a full state sync to clean up any stale database entries
+	// and orphaned nftables chains that cleanupRules may have missed.
+	r.syncState(ctx)
+
 	r.wg.Add(2)
 	go func() {
 		defer r.wg.Done()
@@ -125,6 +129,12 @@ func (r *RuleManager) Start(ctx context.Context) error {
 	if err := r.syncContainers(ctx); err != nil {
 		r.logger.Error("error syncing containers", zap.Error(err))
 	}
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.startPeriodicSync(ctx)
+	}()
 
 	r.wg.Add(1)
 	go func() {
