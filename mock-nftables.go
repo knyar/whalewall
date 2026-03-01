@@ -27,6 +27,7 @@ type firewallClient interface {
 
 	AddSet(s *nftables.Set, vals []nftables.SetElement) error
 	DelSet(s *nftables.Set)
+	GetSetElements(s *nftables.Set) ([]nftables.SetElement, error)
 	SetAddElements(s *nftables.Set, vals []nftables.SetElement) error
 	SetDeleteElements(s *nftables.Set, vals []nftables.SetElement) error
 
@@ -225,6 +226,20 @@ func (m *mockFirewall) DelSet(s *nftables.Set) {
 
 	delete(t.Sets, s.Name)
 	m.tables[s.Table.Name] = t
+}
+
+func (m *mockFirewall) GetSetElements(s *nftables.Set) ([]nftables.SetElement, error) {
+	t, ok := m.tables[s.Table.Name]
+	if !ok {
+		return nil, fmt.Errorf("table %q not found", s.Table.Name)
+	}
+
+	elements, ok := t.Sets[s.Name]
+	if !ok {
+		return nil, fmt.Errorf("set %q not found", s.Name)
+	}
+
+	return slices.Clone(elements), nil
 }
 
 func (m *mockFirewall) SetAddElements(s *nftables.Set, vals []nftables.SetElement) error {

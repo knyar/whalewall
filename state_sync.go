@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/docker/client"
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"go.uber.org/zap"
 )
 
@@ -245,6 +246,33 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 				continue
 			}
 			deleteRulesFromContainer(r.logger, nfc, otherRules, containerID)
+		}
+	}
+
+	// Remove verdict map set elements that jump to this chain. The
+	// containerAddrSet is a verdict map: IP → jump(container-chain).
+	// These set elements hold a reference to the chain, so the chain
+	// cannot be deleted while they exist (nftables returns EBUSY).
+	elements, err := nfc.GetSetElements(containerAddrSet)
+	if err == nil {
+		for _, elem := range elements {
+			if elem.VerdictData != nil &&
+				(elem.VerdictData.Kind == expr.VerdictJump || elem.VerdictData.Kind == expr.VerdictGoto) &&
+				elem.VerdictData.Chain == c.Name {
+				if err := nfc.SetDeleteElements(containerAddrSet, []nftables.SetElement{{Key: elem.Key}}); err != nil {
+					r.logger.Error("sync: error queuing set element deletion",
+						zap.String("chain.name", c.Name),
+						zap.Error(err),
+					)
+					continue
+				}
+				if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
+					r.logger.Error("sync: error deleting set element for orphaned chain",
+						zap.String("chain.name", c.Name),
+						zap.Error(err),
+					)
+				}
+			}
 		}
 	}
 
