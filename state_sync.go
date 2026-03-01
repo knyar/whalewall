@@ -163,7 +163,7 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 			r.logger.Info("sync: removing orphaned chain with no container ID",
 				zap.String("chain.name", c.Name),
 			)
-			r.removeOrphanedChain(ctx, nfc, c, rules, "")
+			r.removeOrphanedChain(ctx, nfc, c, rules, "", chains)
 			continue
 		}
 
@@ -192,17 +192,23 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 			zap.String("chain.name", c.Name),
 			zap.String("container.id", truncID),
 		)
-		r.removeOrphanedChain(ctx, nfc, c, rules, containerID)
+		r.removeOrphanedChain(ctx, nfc, c, rules, containerID, chains)
 	}
 
 	return nil
 }
 
 // removeOrphanedChain removes an nftables chain, its rules, and any
-// references to it from the main whalewall chain. When a container ID is
-// known, the container tracker lock is held to prevent racing with
-// concurrent create/delete operations from Docker event handlers.
-func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClient, c *nftables.Chain, rules []*nftables.Rule, containerID string) {
+// references to it from other chains. When a container ID is known, the
+// container tracker lock is held to prevent racing with concurrent
+// create/delete operations from Docker event handlers.
+//
+// In addition to removing jump rules from the main whalewall chain, this
+// also scans all other whalewall-* chains for "established connection"
+// rules that reference this container (identified by UserData). These
+// cross-chain references must be removed before the chain can be deleted,
+// otherwise nftables returns EBUSY.
+func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClient, c *nftables.Chain, rules []*nftables.Rule, containerID string, allChains []*nftables.Chain) {
 	// Acquire the container tracker lock if we know the container ID,
 	// so we don't race with event-driven create/delete for the same container.
 	if containerID != "" {
@@ -212,9 +218,33 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 			defer cleanup()
 		}
 
+		// Delete rules from the main whalewall chain that jump to this
+		// container's chain.
 		whalewallRules, err := nfc.GetRules(filterTable, whalewallChain)
 		if err == nil {
 			deleteRulesFromContainer(r.logger, nfc, whalewallRules, containerID)
+		}
+
+		// Delete "established connection" rules in other containers'
+		// chains that reference this container. Without this, the chain
+		// deletion fails with EBUSY because other chains still have
+		// jump/goto rules targeting it.
+		for _, other := range allChains {
+			if other.Table.Name != filterTableName {
+				continue
+			}
+			if !strings.HasPrefix(other.Name, chainPrefix) || other.Name == whalewallChainName {
+				continue
+			}
+			// Skip the chain we're about to delete.
+			if other.Name == c.Name {
+				continue
+			}
+			otherRules, err := nfc.GetRules(filterTable, other)
+			if err != nil {
+				continue
+			}
+			deleteRulesFromContainer(r.logger, nfc, otherRules, containerID)
 		}
 	}
 
