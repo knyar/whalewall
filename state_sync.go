@@ -206,7 +206,8 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 	// Acquire the container tracker lock if we know the container ID,
 	// so we don't race with event-driven create/delete for the same container.
 	if containerID != "" {
-		ctx, cleanup, _ := r.containerTracker.StartDeletingContainer(ctx, containerID)
+		var cleanup func()
+		ctx, cleanup, _ = r.containerTracker.StartDeletingContainer(ctx, containerID)
 		if cleanup != nil {
 			defer cleanup()
 		}
