@@ -8,7 +8,7 @@ VALUES
 	);
 
 -- name: AddContainerAddr :exec
-INSERT INTO
+INSERT OR REPLACE INTO
 	addrs(addr, container_id)
 VALUES
 	(
