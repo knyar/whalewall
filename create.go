@@ -225,6 +225,8 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		}
 		rules = rules[:j]
 
+		logger.Debug("flushing rules", zap.Int("num_rules", len(rules)), zap.Bool("insert", insert))
+
 		if insert {
 			// insert rules in reverse order that they were created in to maintain order
 			for i := len(rules) - 1; i >= 0; i-- {
@@ -236,7 +238,11 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 			}
 		}
 
-		return nfc.Flush()
+		if err := nfc.Flush(); err != nil {
+			logger.Debug("flush failed", zap.Int("num_rules", len(rules)), zap.Bool("insert", insert), zap.Error(err))
+			return err
+		}
+		return nil
 	}
 
 	// create rule to drop all not explicitly allowed traffic
@@ -1181,7 +1187,7 @@ func createIPExprs(nfc firewallClient, addrs []addrOrRange, addrOffset uint32, c
 				Table:     chain.Table,
 				Anonymous: true,
 				Constant:  true,
-				KeyType:   nftables.TypeInetService,
+				KeyType:   nftables.TypeIPAddr,
 			}
 			if err := nfc.AddSet(set, singleAddrElems); err != nil {
 				return nil, fmt.Errorf("error creating set: %w", err)
