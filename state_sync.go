@@ -96,8 +96,15 @@ func (r *RuleManager) cleanupStaleDBEntries(ctx context.Context) error {
 
 // forceDeleteContainerFromDB removes all database entries for a container
 // without touching nftables. This is used as a fallback when the normal
-// deleteContainerRules fails due to nftables errors.
+// deleteContainerRules fails due to nftables errors. It acquires the
+// container tracker lock to prevent racing with concurrent create/delete
+// operations from Docker event handlers.
 func (r *RuleManager) forceDeleteContainerFromDB(ctx context.Context, id string) error {
+	ctx, cleanup, _ := r.containerTracker.StartDeletingContainer(ctx, id)
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	tx, err := r.db.Begin(ctx, r.logger)
 	if err != nil {
 		return err
@@ -156,7 +163,7 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 			r.logger.Info("sync: removing orphaned chain with no container ID",
 				zap.String("chain.name", c.Name),
 			)
-			r.removeOrphanedChain(nfc, c, rules, "")
+			r.removeOrphanedChain(ctx, nfc, c, rules, "")
 			continue
 		}
 
@@ -185,17 +192,25 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 			zap.String("chain.name", c.Name),
 			zap.String("container.id", truncID),
 		)
-		r.removeOrphanedChain(nfc, c, rules, containerID)
+		r.removeOrphanedChain(ctx, nfc, c, rules, containerID)
 	}
 
 	return nil
 }
 
 // removeOrphanedChain removes an nftables chain, its rules, and any
-// references to it from the main whalewall chain.
-func (r *RuleManager) removeOrphanedChain(nfc firewallClient, c *nftables.Chain, rules []*nftables.Rule, containerID string) {
-	// Delete rules referencing this container from the main whalewall chain.
+// references to it from the main whalewall chain. When a container ID is
+// known, the container tracker lock is held to prevent racing with
+// concurrent create/delete operations from Docker event handlers.
+func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClient, c *nftables.Chain, rules []*nftables.Rule, containerID string) {
+	// Acquire the container tracker lock if we know the container ID,
+	// so we don't race with event-driven create/delete for the same container.
 	if containerID != "" {
+		ctx, cleanup, _ := r.containerTracker.StartDeletingContainer(ctx, containerID)
+		if cleanup != nil {
+			defer cleanup()
+		}
+
 		whalewallRules, err := nfc.GetRules(filterTable, whalewallChain)
 		if err == nil {
 			deleteRulesFromContainer(r.logger, nfc, whalewallRules, containerID)
