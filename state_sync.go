@@ -1,6 +1,7 @@
 package whalewall
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"syscall"
@@ -251,12 +252,15 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 	// containerAddrSet is a verdict map: IP → jump(container-chain).
 	// These set elements hold a reference to the chain, so the chain
 	// cannot be deleted while they exist (nftables returns EBUSY).
+	//
+	// Note: GetSetElements returns VerdictData as nil; the nftables
+	// library stores the raw verdict data in Val instead. We match
+	// by checking if the chain name appears in the raw verdict bytes.
 	elements, err := nfc.GetSetElements(containerAddrSet)
 	if err == nil {
+		chainNameBytes := []byte(c.Name)
 		for _, elem := range elements {
-			if elem.VerdictData != nil &&
-				(elem.VerdictData.Kind == expr.VerdictJump || elem.VerdictData.Kind == expr.VerdictGoto) &&
-				elem.VerdictData.Chain == c.Name {
+			if bytes.Contains(elem.Val, chainNameBytes) {
 				if err := nfc.SetDeleteElements(containerAddrSet, []nftables.SetElement{{Key: elem.Key}}); err != nil {
 					r.logger.Error("sync: error queuing set element deletion",
 						zap.String("chain.name", c.Name),

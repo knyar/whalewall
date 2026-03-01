@@ -25,7 +25,7 @@ func (q *Queries) AddContainer(ctx context.Context, iD string, name string) erro
 }
 
 const addContainerAddr = `-- name: AddContainerAddr :exec
-INSERT INTO
+INSERT OR REPLACE INTO
 	addrs(addr, container_id)
 VALUES
 	(
