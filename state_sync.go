@@ -35,6 +35,15 @@ func (r *RuleManager) syncState(ctx context.Context) {
 // Unlike cleanupRules, this function always cleans the database even if
 // nftables operations fail.
 func (r *RuleManager) cleanupStaleDBEntries(ctx context.Context) error {
+	// Remove orphaned addrs rows whose container_id doesn't match any
+	// existing container. These can accumulate from incomplete cleanup
+	// or if foreign key enforcement was previously disabled.
+	if n, err := r.db.DeleteOrphanedAddrs(ctx); err != nil {
+		r.logger.Error("sync: error deleting orphaned addrs", zap.Error(err))
+	} else if n > 0 {
+		r.logger.Info("sync: deleted orphaned addr entries", zap.Int64("count", n))
+	}
+
 	containers, err := r.db.GetContainers(ctx)
 	if err != nil {
 		return err
@@ -199,16 +208,17 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 	return nil
 }
 
-// removeOrphanedChain removes an nftables chain, its rules, and any
-// references to it from other chains. When a container ID is known, the
-// container tracker lock is held to prevent racing with concurrent
-// create/delete operations from Docker event handlers.
+// removeOrphanedChain removes an nftables chain, its rules, and all
+// references to it. Before deleting the chain, it removes:
+//   - rules in other chains whose verdict jumps/gotos to this chain
+//   - verdict map set elements in containerAddrSet that target this chain
+//   - all rules within the chain itself
 //
-// In addition to removing jump rules from the main whalewall chain, this
-// also scans all other whalewall-* chains for "established connection"
-// rules that reference this container (identified by UserData). These
-// cross-chain references must be removed before the chain can be deleted,
-// otherwise nftables returns EBUSY.
+// References are found by inspecting verdict expressions and set element
+// verdicts rather than relying on UserData, so this works even when the
+// container ID is unknown (e.g. the chain's rules were already deleted).
+// When a container ID is known, the container tracker lock is held to
+// prevent racing with concurrent Docker event handlers.
 func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClient, c *nftables.Chain, rules []*nftables.Rule, containerID string, allChains []*nftables.Chain) {
 	// Acquire the container tracker lock if we know the container ID,
 	// so we don't race with event-driven create/delete for the same container.
@@ -218,35 +228,23 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 		if cleanup != nil {
 			defer cleanup()
 		}
+	}
 
-		// Delete rules from the main whalewall chain that jump to this
-		// container's chain.
-		whalewallRules, err := nfc.GetRules(filterTable, whalewallChain)
-		if err == nil {
-			deleteRulesFromContainer(r.logger, nfc, whalewallRules, containerID)
+	// Delete all rules in other chains that jump/goto to the chain we
+	// are about to delete. This covers both:
+	//   - jump rules in the main whalewall chain
+	//   - "established connection" rules in other container chains
+	// We match by verdict target chain name rather than UserData so
+	// this works even when the containerID is unknown.
+	for _, other := range allChains {
+		if other.Table.Name != filterTableName || other.Name == c.Name {
+			continue
 		}
-
-		// Delete "established connection" rules in other containers'
-		// chains that reference this container. Without this, the chain
-		// deletion fails with EBUSY because other chains still have
-		// jump/goto rules targeting it.
-		for _, other := range allChains {
-			if other.Table.Name != filterTableName {
-				continue
-			}
-			if !strings.HasPrefix(other.Name, chainPrefix) || other.Name == whalewallChainName {
-				continue
-			}
-			// Skip the chain we're about to delete.
-			if other.Name == c.Name {
-				continue
-			}
-			otherRules, err := nfc.GetRules(filterTable, other)
-			if err != nil {
-				continue
-			}
-			deleteRulesFromContainer(r.logger, nfc, otherRules, containerID)
+		otherRules, err := nfc.GetRules(filterTable, other)
+		if err != nil {
+			continue
 		}
+		deleteRulesJumpingToChain(r.logger, nfc, otherRules, c.Name)
 	}
 
 	// Remove verdict map set elements that jump to this chain. The
@@ -300,6 +298,37 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 			zap.String("chain.name", c.Name),
 			zap.Error(err),
 		)
+	}
+}
+
+// deleteRulesJumpingToChain removes rules that have a verdict jumping or
+// going to the specified chain. Unlike deleteRulesFromContainer which
+// matches by UserData, this matches by inspecting the verdict expression
+// in each rule, so it works even when the container ID is unknown.
+func deleteRulesJumpingToChain(logger *zap.Logger, nfc firewallClient, rules []*nftables.Rule, chainName string) {
+	for _, rule := range rules {
+		for _, e := range rule.Exprs {
+			verdict, ok := e.(*expr.Verdict)
+			if !ok {
+				continue
+			}
+			if (verdict.Kind == expr.VerdictJump || verdict.Kind == expr.VerdictGoto) && verdict.Chain == chainName {
+				if err := nfc.DelRule(rule); err != nil {
+					logger.Error("sync: error deleting rule jumping to chain",
+						zap.String("target.chain", chainName),
+						zap.Error(err),
+					)
+					break
+				}
+				if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
+					logger.Error("sync: error flushing rule deletion",
+						zap.String("target.chain", chainName),
+						zap.Error(err),
+					)
+				}
+				break
+			}
+		}
 	}
 }
 

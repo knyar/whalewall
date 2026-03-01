@@ -22,6 +22,7 @@ const (
 type DB interface {
 	Querier
 	Begin(ctx context.Context, logger *zap.Logger) (TX, error)
+	DeleteOrphanedAddrs(ctx context.Context) (int64, error)
 	io.Closer
 }
 
@@ -114,6 +115,17 @@ type tx struct {
 	*Queries
 	ctx    context.Context
 	logger *zap.Logger
+}
+
+// DeleteOrphanedAddrs removes addrs rows whose container_id does not
+// reference any existing container. These can accumulate if foreign key
+// enforcement was previously disabled or from incomplete cleanup.
+func (d *db) DeleteOrphanedAddrs(ctx context.Context) (int64, error) {
+	result, err := d.db.ExecContext(ctx, "DELETE FROM addrs WHERE container_id NOT IN (SELECT id FROM containers)")
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (d *db) Begin(ctx context.Context, logger *zap.Logger) (TX, error) {
