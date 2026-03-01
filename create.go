@@ -225,6 +225,20 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		}
 		rules = rules[:j]
 
+		if len(rules) == 0 {
+			// All rules already exist. Create a new netlink connection
+			// to discard any buffered anonymous set operations that have
+			// no referencing rules in this batch; the kernel rejects
+			// anonymous sets that are not bound to a rule.
+			logger.Debug("all rules already exist, skipping flush")
+			newNfc, err := r.newFirewallClient()
+			if err != nil {
+				return fmt.Errorf("error creating netlink connection: %w", err)
+			}
+			nfc = newNfc
+			return nil
+		}
+
 		logger.Debug("flushing rules", zap.Int("num_rules", len(rules)), zap.Bool("insert", insert))
 
 		if insert {
