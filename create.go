@@ -56,6 +56,50 @@ var (
 	}
 )
 
+// anonSetRecord stores the definition and elements of an anonymous set
+// so it can be recreated on a fresh nfc connection if needed.
+type anonSetRecord struct {
+	set   nftables.Set
+	elems []nftables.SetElement
+}
+
+// setRecordingClient wraps a firewallClient and records anonymous sets
+// created via AddSet. When some rules are filtered during deduplication,
+// the remaining rules' anonymous sets can be recreated on a new nfc
+// connection, avoiding orphaned sets that the kernel rejects with EINVAL.
+type setRecordingClient struct {
+	firewallClient
+	anonSets map[uint32]anonSetRecord
+}
+
+func newSetRecordingClient(fc firewallClient) *setRecordingClient {
+	return &setRecordingClient{
+		firewallClient: fc,
+		anonSets:       make(map[uint32]anonSetRecord),
+	}
+}
+
+func (s *setRecordingClient) AddSet(set *nftables.Set, vals []nftables.SetElement) error {
+	if err := s.firewallClient.AddSet(set, vals); err != nil {
+		return err
+	}
+	if set.Anonymous {
+		s.anonSets[set.ID] = anonSetRecord{
+			set: nftables.Set{
+				Table:     set.Table,
+				Anonymous: set.Anonymous,
+				Constant:  set.Constant,
+				Interval:  set.Interval,
+				KeyType:   set.KeyType,
+				DataType:  set.DataType,
+				IsMap:     set.IsMap,
+			},
+			elems: slices.Clone(vals),
+		}
+	}
+	return nil
+}
+
 // createRules adds nftables rules for started containers.
 func (r *RuleManager) createRules(ctx context.Context) {
 	for c := range r.createCh {
@@ -114,10 +158,11 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		addrs[netName] = ref(addr.As4())[:]
 	}
 
-	nfc, err := r.newFirewallClient()
+	rawNfc, err := r.newFirewallClient()
 	if err != nil {
 		return fmt.Errorf("error creating netlink connection: %w", err)
 	}
+	nfc := newSetRecordingClient(rawNfc)
 
 	// create chain for this container's rules
 	contChainName := buildChainName(contName, container.ID)
@@ -214,6 +259,7 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 			currentRules[rule.Chain.Name] = curRules
 		}
 
+		originalLen := len(rules)
 		j := 0
 		for _, rule := range rules {
 			// keep rules that don't already exist, discard the rest
@@ -235,8 +281,52 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 			if err != nil {
 				return fmt.Errorf("error creating netlink connection: %w", err)
 			}
-			nfc = newNfc
+			nfc = newSetRecordingClient(newNfc)
 			return nil
+		}
+
+		// If some rules were filtered, the nfc buffer contains orphaned
+		// anonymous sets (from filtered rules) that would cause the kernel
+		// to reject the batch with EINVAL. Recreate only the needed sets
+		// on a fresh nfc connection.
+		if len(rules) < originalLen {
+			logger.Debug("recreating anonymous sets for remaining rules",
+				zap.Int("original_rules", originalLen),
+				zap.Int("remaining_rules", len(rules)),
+			)
+			oldRecorder := nfc
+			newNfc, err := r.newFirewallClient()
+			if err != nil {
+				return fmt.Errorf("error creating netlink connection: %w", err)
+			}
+			nfc = newSetRecordingClient(newNfc)
+
+			for _, rule := range rules {
+				for _, e := range rule.Exprs {
+					lookup, ok := e.(*expr.Lookup)
+					if !ok {
+						continue
+					}
+					record, ok := oldRecorder.anonSets[lookup.SetID]
+					if !ok {
+						continue
+					}
+					newSet := &nftables.Set{
+						Table:     record.set.Table,
+						Anonymous: record.set.Anonymous,
+						Constant:  record.set.Constant,
+						Interval:  record.set.Interval,
+						KeyType:   record.set.KeyType,
+						DataType:  record.set.DataType,
+						IsMap:     record.set.IsMap,
+					}
+					if err := nfc.AddSet(newSet, record.elems); err != nil {
+						return fmt.Errorf("error recreating anonymous set: %w", err)
+					}
+					lookup.SetName = newSet.Name
+					lookup.SetID = newSet.ID
+				}
+			}
 		}
 
 		logger.Debug("flushing rules", zap.Int("num_rules", len(rules)), zap.Bool("insert", insert))
