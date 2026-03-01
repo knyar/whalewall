@@ -170,11 +170,23 @@ func (a *addrOrRange) IsValid() bool {
 }
 
 func (a *addrOrRange) Addr() (netip.Addr, bool) {
-	return a.addr, a.addr.IsValid()
+	if a.addr.IsValid() {
+		return a.addr, true
+	}
+	// Treat single-address ranges (e.g., /32 CIDR) as single addresses.
+	// This avoids creating degenerate nftables interval set elements
+	// where start == end, which the kernel rejects with EINVAL.
+	if a.addrRange.IsValid() && a.addrRange.From() == a.addrRange.To() {
+		return a.addrRange.From(), true
+	}
+	return a.addr, false
 }
 
 func (a *addrOrRange) Range() (netip.Addr, netip.Addr, bool) {
-	return a.addrRange.From(), a.addrRange.To(), a.addrRange.IsValid()
+	if a.addrRange.IsValid() && a.addrRange.From() != a.addrRange.To() {
+		return a.addrRange.From(), a.addrRange.To(), true
+	}
+	return a.addrRange.From(), a.addrRange.To(), false
 }
 
 type protocol uint8

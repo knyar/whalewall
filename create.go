@@ -1220,15 +1220,19 @@ func createIPExprs(nfc firewallClient, addrs []addrOrRange, addrOffset uint32, c
 			addrRangeElems = append(addrRangeElems, nftables.SetElement{
 				Key: addrRangeLow,
 			})
+			// nftables interval sets use half-open intervals [start, end),
+			// so the end element must be one past the high address
+			endAddr := highAddr.Next()
 			addrRangeElems = append(addrRangeElems, nftables.SetElement{
-				Key:         addrRangeHigh,
+				Key:         ref(endAddr.As4())[:],
 				IntervalEnd: true,
 			})
 		}
 	}
 	if len(addrRangeElems) != 0 {
 		if len(addrRangeElems) == 2 {
-			// there is only one single port range, no need to create a set
+			// there is only one single port range, no need to create a set;
+			// compareAddrRangeExprs uses closed interval (gte/lte)
 			exprs = append(exprs, compareAddrRangeExprs(addrRangeLow, addrRangeHigh)...)
 		} else {
 			set := &nftables.Set{
@@ -1302,8 +1306,10 @@ func createPortExprs(nfc firewallClient, ports []rulePorts, portOffset uint32, c
 			portIntervalElems = append(portIntervalElems, nftables.SetElement{
 				Key: binary.BigEndian.AppendUint16(nil, port.interval.min),
 			})
+			// nftables interval sets use half-open intervals [start, end),
+			// so the end element must be one past the max port
 			portIntervalElems = append(portIntervalElems, nftables.SetElement{
-				Key:         binary.BigEndian.AppendUint16(nil, port.interval.max),
+				Key:         binary.BigEndian.AppendUint16(nil, port.interval.max+1),
 				IntervalEnd: true,
 			})
 		}
