@@ -504,11 +504,13 @@ func (m *mockFirewall) Flush() error {
 	}
 	m.unsetLookupExprs = nil
 
-	// delete unused anonymous sets
+	// reject batches with orphaned anonymous sets, matching kernel
+	// behavior: the kernel returns EINVAL for anonymous sets not
+	// bound to any rule
 	for _, t := range m.tables {
-		for newAnonSet, used := range t.newAnonSets {
+		for _, used := range t.newAnonSets {
 			if !used {
-				delete(t.Sets, newAnonSet)
+				return syscall.EINVAL
 			}
 		}
 	}

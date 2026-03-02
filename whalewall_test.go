@@ -362,8 +362,8 @@ var (
 	gatewayAddr = netip.MustParseAddr("172.0.1.1")
 	cont1Addr   = netip.MustParseAddr("172.0.1.2")
 	cont2Addr   = netip.MustParseAddr("172.0.1.3")
-	dstAddr     = netip.MustParseAddr("1.1.1.1")
-	dstRange    = netipx.RangeOfPrefix(netip.MustParsePrefix("192.168.1.0/24"))
+	dstAddr  = netip.MustParseAddr("1.1.1.1")
+	dstRange = netipx.RangeOfPrefix(netip.MustParsePrefix("192.168.1.0/24"))
 	lowDstAddr  = dstRange.From()
 	highDstAddr = dstRange.To()
 )
@@ -2053,6 +2053,136 @@ mapped_ports:
 			},
 		},
 		{
+			name: "allow access from multiple /32 IPs to mapped ports",
+			containers: []types.ContainerJSON{
+				{
+					ContainerJSONBase: &types.ContainerJSONBase{
+						ID:   cont1ID,
+						Name: "/" + cont1Name,
+					},
+					Config: &container.Config{
+						Labels: map[string]string{
+							enabledLabel: "true",
+							rulesLabel: `
+mapped_ports:
+  external:
+    allow: true
+    ips:
+      - 10.0.0.1/32
+      - 10.0.0.2/32`,
+						},
+					},
+					NetworkSettings: &types.NetworkSettings{
+						NetworkSettingsBase: types.NetworkSettingsBase{
+							Ports: nat.PortMap{
+								"80/tcp": []nat.PortBinding{
+									{
+										HostIP:   "0.0.0.0",
+										HostPort: "8080",
+									},
+									{
+										HostIP:   "::",
+										HostPort: "8080",
+									},
+								},
+							},
+						},
+						Networks: map[string]*network.EndpointSettings{
+							"default": {
+								Gateway:   gatewayAddr.String(),
+								IPAddress: cont1Addr.String(),
+							},
+						},
+					},
+				},
+			},
+			expectedRules: map[*nftables.Chain][]*nftables.Rule{
+				whalewallChain: {
+					{
+						Exprs: slicesJoin(
+							matchAddrExprs(ref(localAddr.As4())[:], srcAddrOffset),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							matchPortExprs(8080, dstPortOffset),
+							matchConnStateExprs(stateNew),
+							[]expr.Any{
+								&expr.Counter{},
+								dropVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					srcJumpRule,
+					dstJumpRule,
+				},
+				{
+					Name:  buildChainName(cont1Name, cont1ID),
+					Table: filterTable,
+				}: {
+					// gateway drop rule (localhost not allowed)
+					{
+						Exprs: slicesJoin(
+							matchAddrExprs(ref(gatewayAddr.As4())[:], srcAddrOffset),
+							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							matchPortExprs(80, dstPortOffset),
+							matchConnStateExprs(stateNew),
+							[]expr.Any{
+								&expr.Counter{},
+								dropVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					// external allow with anonymous set for 2 IPs
+					{
+						Exprs: slicesJoin(
+							[]expr.Any{
+								getAddrExpr(srcAddrOffset),
+								matchFromSetExpr(&nftables.Set{
+									Name: anonSetName,
+								}),
+							},
+							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							matchPortExprs(80, dstPortOffset),
+							matchConnStateExprs(stateNewEst),
+							[]expr.Any{
+								&expr.Counter{},
+								acceptVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					{
+						Exprs: slicesJoin(
+							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
+							[]expr.Any{
+								getAddrExpr(dstAddrOffset),
+								matchFromSetExpr(&nftables.Set{
+									Name: anonSetName,
+								}),
+							},
+							matchProtoExprs(unix.IPPROTO_TCP),
+							matchPortExprs(80, srcPortOffset),
+							matchConnStateExprs(stateEst),
+							[]expr.Any{
+								&expr.Counter{},
+								acceptVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					createDropRule(
+						&nftables.Chain{
+							Name:  buildChainName(cont1Name, cont1ID),
+							Table: filterTable,
+						},
+						cont1ID,
+					),
+				},
+			},
+		},
+		{
 			name: "allow localhost access to mapped ports",
 			containers: []types.ContainerJSON{
 				{
@@ -2955,6 +3085,120 @@ output:
 		_, err = mfc.GetRules(filterTable, chain)
 		is.True(errors.Is(err, syscall.ENOENT))
 	})
+}
+
+// TestPartialDeduplication tests that createContainerRules succeeds when
+// some rules in a batch already exist (triggering partial deduplication)
+// and anonymous sets are involved. Without the setRecordingClient fix,
+// orphaned anonymous sets from filtered rules would cause EINVAL.
+func TestPartialDeduplication(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	logger, err := zap.NewDevelopment()
+	is.NoErr(err)
+
+	dbFile := filepath.Join(t.TempDir(), "db.sqlite")
+	r, err := NewRuleManager(context.Background(), logger, dbFile, defaultTimeout)
+	is.NoErr(err)
+
+	dockerCli := newMockDockerClient(nil)
+	r.newDockerClient = func() (dockerClient, error) {
+		return dockerCli, nil
+	}
+
+	firewallCreator := newMockFirewallCreator(logger)
+	mfc := firewallCreator.newMockFirewall()
+	mfc.AddTable(filterTable)
+	mfc.AddChain(&nftables.Chain{
+		Name:  dockerChainName,
+		Table: filterTable,
+		Type:  nftables.ChainTypeFilter,
+	})
+	is.NoErr(mfc.Flush())
+	r.newFirewallClient = func() (firewallClient, error) {
+		return firewallCreator.newMockFirewall(), nil
+	}
+
+	err = r.init(context.Background())
+	is.NoErr(err)
+	err = r.createBaseRules()
+	is.NoErr(err)
+
+	// Container with multiple external IPs on mapped ports.
+	// The two IPs create anonymous sets in the rules.
+	cont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:   cont1ID,
+			Name: "/" + cont1Name,
+		},
+		Config: &container.Config{
+			Labels: map[string]string{
+				enabledLabel: "true",
+				rulesLabel: `
+mapped_ports:
+  external:
+    allow: true
+    ips:
+      - 10.0.0.1/32
+      - 10.0.0.2/32`,
+			},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			NetworkSettingsBase: types.NetworkSettingsBase{
+				Ports: nat.PortMap{
+					"80/tcp": []nat.PortBinding{
+						{
+							HostIP:   "0.0.0.0",
+							HostPort: "8080",
+						},
+						{
+							HostIP:   "::",
+							HostPort: "8080",
+						},
+					},
+				},
+			},
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont1Addr.String(),
+				},
+			},
+		},
+	}
+
+	// First pass: create all rules
+	err = r.createContainerRules(context.Background(), cont, true)
+	is.NoErr(err)
+
+	// Verify rules were created
+	contChain := &nftables.Chain{
+		Name:  buildChainName(cont1Name, cont1ID),
+		Table: filterTable,
+	}
+	rules, err := mfc.GetRules(filterTable, contChain)
+	is.NoErr(err)
+	is.True(len(rules) > 0)
+
+	// Delete one rule from the container chain to create a partial
+	// state. On the next createContainerRules call, some rules in
+	// the port map batch will exist and others won't, triggering
+	// partial deduplication with orphaned anonymous sets.
+	err = mfc.DelRule(rules[0])
+	is.NoErr(err)
+	is.NoErr(mfc.Flush())
+
+	// Second pass: should succeed despite partial deduplication
+	// with anonymous sets. Without the setRecordingClient fix,
+	// this would fail with EINVAL from orphaned anonymous sets.
+	err = r.createContainerRules(context.Background(), cont, false)
+	is.NoErr(err)
+
+	// Verify rules are restored
+	rules, err = mfc.GetRules(filterTable, contChain)
+	is.NoErr(err)
+	is.True(len(rules) > 0)
 }
 
 func compareRules(t *testing.T, comparer func(r1, r2 *nftables.Rule) bool, chainName string, expectedRules, rules []*nftables.Rule) {
