@@ -391,24 +391,16 @@ func (r *RuleManager) cleanupOrphanedMapEntries(ctx context.Context) error {
 		return nil
 	}
 
-	containers, err := r.db.GetContainers(ctx)
+	// Fetch all tracked addrs in a single query rather than looping
+	// over containers — the orphan check is O(map size + DB size)
+	// regardless of how many containers exist.
+	allAddrs, err := r.db.GetAllAddrs(ctx)
 	if err != nil {
-		return fmt.Errorf("error getting containers from database: %w", err)
+		return fmt.Errorf("error getting addrs from database: %w", err)
 	}
-	knownAddrs := make(map[string]struct{})
-	for _, c := range containers {
-		addrs, err := r.db.GetContainerAddrs(ctx, c.ID)
-		if err != nil {
-			r.logger.Error(
-				"sync: error getting container addrs",
-				zap.String("container.id", c.ID[:12]),
-				zap.Error(err),
-			)
-			continue
-		}
-		for _, a := range addrs {
-			knownAddrs[string(a)] = struct{}{}
-		}
+	knownAddrs := make(map[string]struct{}, len(allAddrs))
+	for _, a := range allAddrs {
+		knownAddrs[string(a)] = struct{}{}
 	}
 
 	orphaned := make([]nftables.SetElement, 0, len(elements))

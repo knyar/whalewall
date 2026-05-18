@@ -23,6 +23,7 @@ type DB interface {
 	Querier
 	Begin(ctx context.Context, logger *zap.Logger) (TX, error)
 	DeleteOrphanedAddrs(ctx context.Context) (int64, error)
+	GetAllAddrs(ctx context.Context) ([][]byte, error)
 	io.Closer
 }
 
@@ -126,6 +127,30 @@ func (d *db) DeleteOrphanedAddrs(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// GetAllAddrs returns every tracked addr in a single query. Used by
+// the periodic orphan-map sweep to avoid the N+1 pattern of looping
+// over containers and querying each one's addrs separately.
+func (d *db) GetAllAddrs(ctx context.Context) ([][]byte, error) {
+	rows, err := d.db.QueryContext(ctx, "SELECT addr FROM addrs")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var addrs [][]byte
+	for rows.Next() {
+		var addr []byte
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, addr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return addrs, nil
 }
 
 func (d *db) Begin(ctx context.Context, logger *zap.Logger) (TX, error) {

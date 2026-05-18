@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"go.uber.org/zap"
@@ -187,9 +188,12 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 
 	// Look up addrs previously tracked in the DB so we can detect
 	// stale entries (e.g. the container restarted and Docker
-	// reassigned a different IP). These must be removed from the
-	// jump map so traffic to the old IP doesn't get misrouted into
-	// this container's chain.
+	// reassigned a different IP). The stale removal — and the new-
+	// addr add — only happen after the DB commit below. Without
+	// this ordering, the periodic orphan sweep could race a
+	// concurrent createContainerRules: it might read a fresh map
+	// entry, fail to find it in the DB (because the tx hasn't
+	// committed yet), and delete it as orphaned.
 	var staleAddrs [][]byte
 	if !isNew {
 		trackedAddrs, err := r.db.GetContainerAddrs(ctx, container.ID)
@@ -207,24 +211,9 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		}
 	}
 
-	if len(staleAddrs) > 0 {
-		logger.Info(
-			"removing stale addrs from container address map",
-			zap.Int("count", len(staleAddrs)),
-		)
-		staleElems := make([]nftables.SetElement, 0, len(staleAddrs))
-		for _, addr := range staleAddrs {
-			staleElems = append(staleElems, nftables.SetElement{Key: addr})
-		}
-		if err := nfc.SetDeleteElements(containerAddrSet, staleElems); err != nil {
-			logger.Error("error queuing stale addr removal", zap.Error(err))
-		} else if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
-			logger.Error("error removing stale addrs from set", zap.Error(err))
-		}
-	}
-
-	// add container IPs to jump set so traffic to/from this
-	// container will go to the correct chain
+	// Build map elements for the current addrs but defer the actual
+	// add until after the DB tx commits (see comment above on the
+	// orphan-sweep race).
 	addrElems := make([]nftables.SetElement, 0, len(addrs))
 	for _, addr := range addrs {
 		addrElems = append(addrElems, nftables.SetElement{
@@ -234,12 +223,6 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 				Chain: contChainName,
 			},
 		})
-	}
-	if err := nfc.SetAddElements(containerAddrSet, addrElems); err != nil {
-		return fmt.Errorf("error marshaling set elements: %w", err)
-	}
-	if err := ignoringErr(nfc.Flush, syscall.EEXIST); err != nil {
-		return fmt.Errorf("error adding elements to container address set: %w", err)
 	}
 
 	// cleanup created rules if the context was canceled
@@ -503,16 +486,53 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		return err
 	}
 
-	if !isNew {
-		return tx.Commit()
+	if isNew {
+		logger.Debug("adding to database")
+		if err := r.addContainerInfo(ctx, tx, container.ID, contName, service, estContainers); err != nil {
+			return fmt.Errorf("error adding container information to database: %w", err)
+		}
+	} else {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("error committing transaction: %w", err)
+		}
 	}
 
-	logger.Debug("adding to database")
+	// Apply map updates AFTER the DB tx commits. This ordering is the
+	// invariant the periodic orphan sweep relies on: a map entry is
+	// only ever visible to the sweep once the DB has already recorded
+	// it. Otherwise the sweep could observe a freshly-added map entry
+	// before its tx commits and delete it as orphaned.
+	return r.applyAddrMapUpdates(logger, nfc, addrElems, staleAddrs)
+}
 
-	if err := r.addContainerInfo(ctx, tx, container.ID, contName, service, estContainers); err != nil {
-		return fmt.Errorf("error adding container information to database: %w", err)
+// applyAddrMapUpdates installs the current container's map entries
+// and removes any stale entries left over from a previous IP. Called
+// after the DB transaction commits so the orphan sweep can rely on
+// DB-then-map ordering for correctness.
+func (r *RuleManager) applyAddrMapUpdates(logger *zap.Logger, nfc firewallClient, addrElems []nftables.SetElement, staleAddrs [][]byte) error {
+	if len(staleAddrs) > 0 {
+		staleElems := make([]nftables.SetElement, 0, len(staleAddrs))
+		for _, addr := range staleAddrs {
+			staleElems = append(staleElems, nftables.SetElement{Key: addr})
+		}
+		if err := nfc.SetDeleteElements(containerAddrSet, staleElems); err != nil {
+			logger.Error("error queuing stale addr removal", zap.Error(err))
+		} else if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
+			logger.Error("error removing stale addrs from set", zap.Error(err))
+		} else {
+			logger.Info(
+				"removed stale addrs from container address map",
+				zap.Int("count", len(staleAddrs)),
+			)
+		}
 	}
 
+	if err := nfc.SetAddElements(containerAddrSet, addrElems); err != nil {
+		return fmt.Errorf("error marshaling set elements: %w", err)
+	}
+	if err := ignoringErr(nfc.Flush, syscall.EEXIST); err != nil {
+		return fmt.Errorf("error adding elements to container address set: %w", err)
+	}
 	return nil
 }
 
@@ -669,12 +689,18 @@ func findNetwork[T any](network, project string, addrs map[string]T) (string, T,
 // containerNameMatches returns true if a canonical container name can
 // be found from a combination of labels and names.
 //
-// When matching by Docker Compose service name, srcProject (the
-// compose project of the container that issued the rule) must match
-// the target's project label. This avoids treating a generic service
-// name like "redis-1" as a match across unrelated compose projects.
-// If either side lacks a compose project label the match is allowed,
-// preserving behavior for non-compose deployments.
+// When matching by Docker Compose service name, the source's compose
+// project (srcProject) must match the target's. The cross-project
+// guard's asymmetry is deliberate:
+//
+//   - If srcProject is empty, the source isn't in a compose project at
+//     all, so it's treated as a non-compose deployment that may
+//     intentionally reference any container by service name.
+//   - If srcProject is set, we require the target to share that
+//     project. A target that carries a service label but no project
+//     label is treated as suspect and rejected — service-only labels
+//     without a paired project are not part of normal Docker Compose
+//     output and should not be matched cross-project.
 func containerNameMatches(expectedName, srcProject string, labels map[string]string, names ...string) bool {
 	if len(expectedName) == 0 {
 		return false
@@ -696,11 +722,12 @@ func containerNameMatches(expectedName, srcProject string, labels map[string]str
 	}
 	// check if the Docker Compose service name matches
 	if serviceName, ok := labels[composeServiceLabel]; ok && serviceName == expectedName {
-		targetProject := labels[composeProjectLabel]
-		if srcProject != "" && targetProject != "" && srcProject != targetProject {
-			return false
+		if srcProject == "" {
+			// Non-compose source; allow service-name match regardless
+			// of target project labels.
+			return true
 		}
-		return true
+		return srcProject == labels[composeProjectLabel]
 	}
 
 	return false
@@ -992,7 +1019,33 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 	var (
 		waitingRules []database.GetWaitingContainerRulesRow
 		aliases      = append([]string{name}, containerAliases(name, service)...)
+		// Inspect results are memoized for the duration of this call.
+		// A single src container typically registers several waiting
+		// rules against a service name, so without memoization we'd
+		// hit the Docker API once per rule. A nil value caches the
+		// "not found" outcome so we don't re-request gone containers.
+		inspectCache = make(map[string]*types.ContainerJSON)
 	)
+
+	inspectSrc := func(srcID string) (*types.ContainerJSON, error) {
+		if cached, ok := inspectCache[srcID]; ok {
+			return cached, nil
+		}
+		cont, err := r.dockerCli.ContainerInspect(ctx, srcID)
+		if err != nil {
+			if client.IsErrNotFound(err) {
+				// Cache the negative result so we don't retry in this call.
+				inspectCache[srcID] = nil
+				return nil, nil //nolint:nilnil // intentionally signals "not found"
+			}
+			// Transient errors (daemon hiccup, ctx cancel, etc.) are
+			// not cached: a retry on the next sync iteration may
+			// succeed.
+			return nil, err
+		}
+		inspectCache[srcID] = &cont
+		return &cont, nil
+	}
 
 	for _, alias := range aliases {
 		rules, err := tx.GetWaitingContainerRules(ctx, alias)
@@ -1009,14 +1062,31 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 		if alias != name && alias != "/"+name && len(rules) > 0 {
 			filtered := make([]database.GetWaitingContainerRulesRow, 0, len(rules))
 			for _, wr := range rules {
-				srcCont, err := r.dockerCli.ContainerInspect(ctx, wr.SrcContainerID)
+				srcCont, err := inspectSrc(wr.SrcContainerID)
 				if err != nil {
-					// src container is gone; skip — it will be
-					// cleaned up when the stale entry is detected.
+					// Transient Docker error — log and skip this
+					// rule for now rather than aborting the whole
+					// sync; a future iteration will retry.
+					logger.Warn(
+						"sync: error inspecting waiting-rule src container, skipping",
+						zap.String("src.id", wr.SrcContainerID[:12]),
+						zap.Error(err),
+					)
 					continue
 				}
+				if srcCont == nil {
+					// Src container is gone; the stale waiting-rule
+					// row will be cleaned up when its container row
+					// is deleted from the DB.
+					continue
+				}
+				// Mirror containerNameMatches: if the waiting rule's
+				// src is in a compose project, require this container
+				// to share it. A non-compose src (no project label)
+				// may legitimately reference any container, so it's
+				// allowed through.
 				srcProject := srcCont.Config.Labels[composeProjectLabel]
-				if srcProject != "" && project != "" && srcProject != project {
+				if srcProject != "" && srcProject != project {
 					continue
 				}
 				filtered = append(filtered, wr)
@@ -1043,9 +1113,14 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 		}
 
 		// find source container IP (not this container)
-		srcCont, err := r.dockerCli.ContainerInspect(ctx, waitingRule.SrcContainerID)
+		srcCont, err := inspectSrc(waitingRule.SrcContainerID)
 		if err != nil {
 			return nil, fmt.Errorf("error inspecting container %q: %w", waitingRule.Name, err)
+		}
+		if srcCont == nil {
+			// Src container vanished between the alias-filter pass
+			// and now; skip this rule.
+			continue
 		}
 		srcProject := srcCont.Config.Labels[composeProjectLabel]
 		srcNetName, srcNetwork, ok := findNetwork(ruleCfg.Network, srcProject, srcCont.NetworkSettings.Networks)
@@ -1595,7 +1670,8 @@ func compareAddrExpr(addr []byte) expr.Any {
 }
 
 func matchAddrRangeExprs(lowAddr, highAddr netip.Addr, offset uint32) []expr.Any {
-	exprs := []expr.Any{getAddrExpr(offset)}
+	exprs := make([]expr.Any, 0, 3)
+	exprs = append(exprs, getAddrExpr(offset))
 	return append(exprs, compareAddrRangeExprs(ref(lowAddr.As4())[:], ref(highAddr.As4())[:])...)
 }
 
@@ -1660,7 +1736,8 @@ func comparePortExpr(port uint16) expr.Any {
 }
 
 func matchPortsExprs(ports portInterval, offset uint32) []expr.Any {
-	exprs := []expr.Any{getPortExpr(offset)}
+	exprs := make([]expr.Any, 0, 3)
+	exprs = append(exprs, getPortExpr(offset))
 	exprs = append(exprs, comparePortsExprs(ports)...)
 	return exprs
 }
