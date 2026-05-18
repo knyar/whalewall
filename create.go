@@ -106,7 +106,8 @@ func (s *setRecordingClient) AddSet(set *nftables.Set, vals []nftables.SetElemen
 func (r *RuleManager) createRules(ctx context.Context) {
 	for c := range r.createCh {
 		if err := r.createContainerRules(ctx, c.container, c.isNew); err != nil {
-			r.logger.Error("error creating rules",
+			r.logger.Error(
+				"error creating rules",
 				zap.String("container.id", c.container.ID[:12]),
 				zap.String("container.name", stripName(c.container.Name)),
 				zap.Error(err),
@@ -207,7 +208,8 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 	}
 
 	if len(staleAddrs) > 0 {
-		logger.Info("removing stale addrs from container address map",
+		logger.Info(
+			"removing stale addrs from container address map",
 			zap.Int("count", len(staleAddrs)),
 		)
 		staleElems := make([]nftables.SetElement, 0, len(staleAddrs))
@@ -327,7 +329,8 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 			// recorded anonymous sets; otherwise, avoid opening an
 			// unnecessary connection.
 			if len(nfc.anonSets) > 0 {
-				logger.Debug("resetting netlink connection to discard buffered anonymous sets",
+				logger.Debug(
+					"resetting netlink connection to discard buffered anonymous sets",
 					zap.Int("anonymous_sets", len(nfc.anonSets)),
 				)
 				newNfc, err := r.newFirewallClient()
@@ -344,7 +347,8 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		// to reject the batch with EINVAL. Recreate only the needed sets
 		// on a fresh nfc connection.
 		if len(rules) < originalLen {
-			logger.Debug("recreating anonymous sets for remaining rules",
+			logger.Debug(
+				"recreating anonymous sets for remaining rules",
 				zap.Int("original_rules", originalLen),
 				zap.Int("remaining_rules", len(rules)),
 			)
@@ -541,7 +545,8 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 		// ensure the specified network exists
 		if ruleCfg.Network != "" {
 			if _, _, ok := findNetwork(ruleCfg.Network, project, addrs); !ok {
-				return fmt.Errorf("output rule #%d: network %q not found",
+				return fmt.Errorf(
+					"output rule #%d: network %q not found",
 					i,
 					ruleCfg.Network,
 				)
@@ -570,7 +575,8 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 						return fmt.Errorf("error parsing container %q label: %w", cont.ID[:12], err)
 					}
 					if !enabled {
-						return fmt.Errorf("output rule #%d: container %q does not have whalewall enabled",
+						return fmt.Errorf(
+							"output rule #%d: container %q does not have whalewall enabled",
 							i,
 							ruleCfg.Container,
 						)
@@ -580,7 +586,8 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 				dstProject := cont.Config.Labels[composeProjectLabel]
 				dstNetName, dstNetwork, ok := findNetwork(ruleCfg.Network, dstProject, cont.NetworkSettings.Networks)
 				if !ok {
-					return fmt.Errorf("output rule #%d: network %q not found for container %q",
+					return fmt.Errorf(
+						"output rule #%d: network %q not found for container %q",
 						i,
 						ruleCfg.Network,
 						ruleCfg.Container,
@@ -766,7 +773,8 @@ func (r *RuleManager) createPortMappingRules(nfc firewallClient, logger *zap.Log
 
 				// TODO: make same checks for external
 				if localAllowed && !addr.IsUnspecified() && addr != localAddr {
-					logger.Sugar().Warnf("local access to mapped ports is allowed, but port %s is listening on %s which is not accessible to localhost",
+					logger.Sugar().Warnf(
+						"local access to mapped ports is allowed, but port %s is listening on %s which is not accessible to localhost",
 						hostPort.HostPort,
 						addr,
 					)
@@ -1042,7 +1050,8 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 		srcProject := srcCont.Config.Labels[composeProjectLabel]
 		srcNetName, srcNetwork, ok := findNetwork(ruleCfg.Network, srcProject, srcCont.NetworkSettings.Networks)
 		if !ok {
-			return nil, fmt.Errorf("network %q not found for container %q",
+			return nil, fmt.Errorf(
+				"network %q not found for container %q",
 				ruleCfg.Network,
 				ruleCfg.Container,
 			)
@@ -1327,14 +1336,16 @@ func createNFTRule(nfc firewallClient, inbound, inversePortOffsets bool, state u
 
 	switch {
 	case cfg.Verdict.Chain != "":
-		exprs = append(exprs,
+		exprs = append(
+			exprs,
 			&expr.Verdict{
 				Kind:  expr.VerdictJump,
 				Chain: cfg.Verdict.Chain,
 			},
 		)
 	case queueNum != 0:
-		exprs = append(exprs,
+		exprs = append(
+			exprs,
 			&expr.Queue{
 				Num: queueNum,
 			},
