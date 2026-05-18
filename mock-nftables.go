@@ -16,7 +16,23 @@ import (
 
 const anonSetName = "__set%d"
 
-var setAllocNum = 1
+// setAllocNum hands out anonymous-set IDs to AddSet. It's package-
+// global because real nftables assigns IDs across all clients in the
+// kernel, but the tests run in parallel with their own firewall
+// instances, so accesses must be synchronized. Use the helper
+// nextSetAllocNum below rather than touching it directly.
+var (
+	setAllocNumMu sync.Mutex
+	setAllocNum   uint32 = 1
+)
+
+func nextSetAllocNum() uint32 {
+	setAllocNumMu.Lock()
+	defer setAllocNumMu.Unlock()
+	n := setAllocNum
+	setAllocNum++
+	return n
+}
 
 type firewallClient interface {
 	AddTable(t *nftables.Table) *nftables.Table
@@ -196,11 +212,11 @@ func (m *mockFirewall) AddSet(s *nftables.Set, vals []nftables.SetElement) error
 
 	setName := s.Name
 	if s.Anonymous {
-		setName = fmt.Sprintf(anonSetName, setAllocNum)
-		s.ID = uint32(setAllocNum)
+		id := nextSetAllocNum()
+		setName = fmt.Sprintf(anonSetName, id)
+		s.ID = id
 		s.Name = anonSetName
 
-		setAllocNum++
 		t.newAnonSets[setName] = false
 	}
 
