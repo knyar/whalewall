@@ -277,11 +277,20 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 			// no referencing rules in this batch; the kernel rejects
 			// anonymous sets that are not bound to a rule.
 			logger.Debug("all rules already exist, skipping flush")
-			newNfc, err := r.newFirewallClient()
-			if err != nil {
-				return fmt.Errorf("error creating netlink connection: %w", err)
+
+			// Only reset the netlink connection if this batch actually
+			// recorded anonymous sets; otherwise, avoid opening an
+			// unnecessary connection.
+			if len(nfc.anonSets) > 0 {
+				logger.Debug("resetting netlink connection to discard buffered anonymous sets",
+					zap.Int("anonymous_sets", len(nfc.anonSets)),
+				)
+				newNfc, err := r.newFirewallClient()
+				if err != nil {
+					return fmt.Errorf("error creating netlink connection: %w", err)
+				}
+				nfc = newSetRecordingClient(newNfc)
 			}
-			nfc = newSetRecordingClient(newNfc)
 			return nil
 		}
 
