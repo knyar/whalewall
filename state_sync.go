@@ -67,20 +67,23 @@ func (r *RuleManager) cleanupStaleDBEntries(ctx context.Context) error {
 		needsCleanup := false
 		if inspectErr != nil {
 			if client.IsErrNotFound(inspectErr) {
-				r.logger.Info("sync: found stale entry for removed container",
+				r.logger.Info(
+					"sync: found stale entry for removed container",
 					zap.String("container.id", truncID),
 					zap.String("container.name", contName),
 				)
 				needsCleanup = true
 			} else {
-				r.logger.Error("sync: error inspecting container",
+				r.logger.Error(
+					"sync: error inspecting container",
 					zap.String("container.id", truncID),
 					zap.Error(inspectErr),
 				)
 				continue
 			}
 		} else if !c.State.Running {
-			r.logger.Info("sync: found stale entry for stopped container",
+			r.logger.Info(
+				"sync: found stale entry for stopped container",
 				zap.String("container.id", truncID),
 				zap.String("container.name", contName),
 			)
@@ -93,7 +96,8 @@ func (r *RuleManager) cleanupStaleDBEntries(ctx context.Context) error {
 
 		// Attempt normal cleanup which handles both nftables and DB.
 		if err := r.deleteContainerRules(ctx, container.ID, contName); err != nil {
-			r.logger.Warn("sync: deleteContainerRules failed, forcing DB cleanup",
+			r.logger.Warn(
+				"sync: deleteContainerRules failed, forcing DB cleanup",
 				zap.String("container.id", truncID),
 				zap.String("container.name", contName),
 				zap.Error(err),
@@ -102,7 +106,8 @@ func (r *RuleManager) cleanupStaleDBEntries(ctx context.Context) error {
 			// ensures stale DB entries are removed even when nftables
 			// operations fail (e.g. chain doesn't exist).
 			if dbErr := r.forceDeleteContainerFromDB(ctx, container.ID); dbErr != nil {
-				r.logger.Error("sync: error force-deleting container from database",
+				r.logger.Error(
+					"sync: error force-deleting container from database",
 					zap.String("container.id", truncID),
 					zap.String("container.name", contName),
 					zap.Error(dbErr),
@@ -161,7 +166,8 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 
 		rules, err := nfc.GetRules(filterTable, c)
 		if err != nil {
-			r.logger.Error("sync: error getting rules of chain",
+			r.logger.Error(
+				"sync: error getting rules of chain",
 				zap.String("chain.name", c.Name),
 				zap.Error(err),
 			)
@@ -180,7 +186,8 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 
 		if containerID == "" {
 			// Chain has no rules with UserData; it's a leftover.
-			r.logger.Info("sync: removing orphaned chain with no container ID",
+			r.logger.Info(
+				"sync: removing orphaned chain with no container ID",
 				zap.String("chain.name", c.Name),
 			)
 			r.removeOrphanedChain(ctx, nfc, c, rules, "", chains)
@@ -195,7 +202,8 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 
 		cont, inspectErr := r.dockerCli.ContainerInspect(ctx, containerID)
 		if inspectErr != nil && !client.IsErrNotFound(inspectErr) {
-			r.logger.Error("sync: error inspecting container for orphaned chain",
+			r.logger.Error(
+				"sync: error inspecting container for orphaned chain",
 				zap.String("chain.name", c.Name),
 				zap.String("container.id", truncID),
 				zap.Error(inspectErr),
@@ -208,7 +216,8 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 			continue
 		}
 
-		r.logger.Info("sync: removing orphaned chain for non-running container",
+		r.logger.Info(
+			"sync: removing orphaned chain for non-running container",
 			zap.String("chain.name", c.Name),
 			zap.String("container.id", truncID),
 		)
@@ -231,10 +240,12 @@ func (r *RuleManager) cleanupOrphanedChains(ctx context.Context) error {
 // prevent racing with concurrent Docker event handlers.
 func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClient, c *nftables.Chain, rules []*nftables.Rule, containerID string, allChains []*nftables.Chain) {
 	// Acquire the container tracker lock if we know the container ID,
-	// so we don't race with event-driven create/delete for the same container.
+	// so we don't race with event-driven create/delete for the same
+	// container. The returned context is discarded because the nft
+	// calls below don't take a context — the cleanup func is what
+	// releases the lock.
 	if containerID != "" {
-		var cleanup func()
-		ctx, cleanup, _ = r.containerTracker.StartDeletingContainer(ctx, containerID)
+		_, cleanup, _ := r.containerTracker.StartDeletingContainer(ctx, containerID)
 		if cleanup != nil {
 			defer cleanup()
 		}
@@ -271,14 +282,16 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 		for _, elem := range elements {
 			if bytes.Contains(elem.Val, chainNameBytes) {
 				if err := nfc.SetDeleteElements(containerAddrSet, []nftables.SetElement{{Key: elem.Key}}); err != nil {
-					r.logger.Error("sync: error queuing set element deletion",
+					r.logger.Error(
+						"sync: error queuing set element deletion",
 						zap.String("chain.name", c.Name),
 						zap.Error(err),
 					)
 					continue
 				}
 				if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
-					r.logger.Error("sync: error deleting set element for orphaned chain",
+					r.logger.Error(
+						"sync: error deleting set element for orphaned chain",
 						zap.String("chain.name", c.Name),
 						zap.Error(err),
 					)
@@ -290,14 +303,16 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 	// Delete all rules from the orphaned chain (required before chain deletion).
 	for _, rule := range rules {
 		if err := nfc.DelRule(rule); err != nil {
-			r.logger.Error("sync: error deleting rule from orphaned chain",
+			r.logger.Error(
+				"sync: error deleting rule from orphaned chain",
 				zap.String("chain.name", c.Name),
 				zap.Error(err),
 			)
 			continue
 		}
 		if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
-			r.logger.Error("sync: error flushing rule deletion",
+			r.logger.Error(
+				"sync: error flushing rule deletion",
 				zap.String("chain.name", c.Name),
 				zap.Error(err),
 			)
@@ -307,7 +322,8 @@ func (r *RuleManager) removeOrphanedChain(ctx context.Context, nfc firewallClien
 	// Delete the chain itself.
 	nfc.DelChain(c)
 	if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
-		r.logger.Error("sync: error deleting orphaned chain",
+		r.logger.Error(
+			"sync: error deleting orphaned chain",
 			zap.String("chain.name", c.Name),
 			zap.Error(err),
 		)
@@ -327,14 +343,16 @@ func deleteRulesJumpingToChain(logger *zap.Logger, nfc firewallClient, rules []*
 			}
 			if (verdict.Kind == expr.VerdictJump || verdict.Kind == expr.VerdictGoto) && verdict.Chain == chainName {
 				if err := nfc.DelRule(rule); err != nil {
-					logger.Error("sync: error deleting rule jumping to chain",
+					logger.Error(
+						"sync: error deleting rule jumping to chain",
 						zap.String("target.chain", chainName),
 						zap.Error(err),
 					)
 					break
 				}
 				if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
-					logger.Error("sync: error flushing rule deletion",
+					logger.Error(
+						"sync: error flushing rule deletion",
 						zap.String("target.chain", chainName),
 						zap.Error(err),
 					)
@@ -381,7 +399,8 @@ func (r *RuleManager) cleanupOrphanedMapEntries(ctx context.Context) error {
 	for _, c := range containers {
 		addrs, err := r.db.GetContainerAddrs(ctx, c.ID)
 		if err != nil {
-			r.logger.Error("sync: error getting container addrs",
+			r.logger.Error(
+				"sync: error getting container addrs",
 				zap.String("container.id", c.ID[:12]),
 				zap.Error(err),
 			)
@@ -392,7 +411,7 @@ func (r *RuleManager) cleanupOrphanedMapEntries(ctx context.Context) error {
 		}
 	}
 
-	var orphaned []nftables.SetElement
+	orphaned := make([]nftables.SetElement, 0, len(elements))
 	for _, elem := range elements {
 		if _, ok := knownAddrs[string(elem.Key)]; ok {
 			continue
@@ -403,7 +422,8 @@ func (r *RuleManager) cleanupOrphanedMapEntries(ctx context.Context) error {
 		return nil
 	}
 
-	r.logger.Info("sync: removing orphaned container address map entries",
+	r.logger.Info(
+		"sync: removing orphaned container address map entries",
 		zap.Int("count", len(orphaned)),
 	)
 	if err := nfc.SetDeleteElements(containerAddrSet, orphaned); err != nil {

@@ -3,6 +3,7 @@ package whalewall
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/netip"
 	"path/filepath"
 	"syscall"
@@ -144,7 +145,7 @@ func TestCleanupStaleDBEntries_RemovedContainer(t *testing.T) {
 
 	// Verify nftables chain was removed.
 	_, err = mfc.GetRules(filterTable, chain)
-	is.True(err == syscall.ENOENT) // chain should be removed
+	is.True(errors.Is(err, syscall.ENOENT)) // chain should be removed
 }
 
 func TestCleanupStaleDBEntries_StoppedContainer(t *testing.T) {
@@ -200,7 +201,7 @@ func TestCleanupStaleDBEntries_StoppedContainer(t *testing.T) {
 	chainName := buildChainName(cont1Name, cont1ID)
 	chain := &nftables.Chain{Table: filterTable, Name: chainName}
 	_, err = mfc.GetRules(filterTable, chain)
-	is.True(err == syscall.ENOENT) // chain should be removed
+	is.True(errors.Is(err, syscall.ENOENT)) // chain should be removed
 }
 
 func TestForceDeleteContainerFromDB(t *testing.T) {
@@ -312,7 +313,7 @@ func TestCleanupOrphanedChains(t *testing.T) {
 
 	// Verify chain was removed.
 	_, err = mfc.GetRules(filterTable, chain)
-	is.True(err == syscall.ENOENT) // orphaned chain should be removed
+	is.True(errors.Is(err, syscall.ENOENT)) // orphaned chain should be removed
 }
 
 func TestSyncStateFixesStaleAddr(t *testing.T) {
@@ -521,7 +522,7 @@ func TestSyncStateTwoContainers(t *testing.T) {
 
 	cont1ChainName := buildChainName(cont1Name, cont1ID)
 	_, err = mfc.GetRules(filterTable, &nftables.Chain{Table: filterTable, Name: cont1ChainName})
-	is.True(err == syscall.ENOENT) // container1 chain should be removed
+	is.True(errors.Is(err, syscall.ENOENT)) // container1 chain should be removed
 
 	// Container2 should still be intact.
 	exists, err = r.containerExists(context.Background(), r.db, cont2ID)
@@ -568,8 +569,8 @@ func TestStaleAddrCleanedOnIPChange(t *testing.T) {
 
 	cont := types.ContainerJSON{
 		ContainerJSONBase: &types.ContainerJSONBase{
-			ID:   cont1ID,
-			Name: "/" + cont1Name,
+			ID:    cont1ID,
+			Name:  "/" + cont1Name,
 			State: &types.ContainerState{Running: true},
 		},
 		Config: &container.Config{
@@ -638,8 +639,8 @@ func TestCleanupOrphanedMapEntries(t *testing.T) {
 	// One real container — its addr should survive the sweep.
 	cont := types.ContainerJSON{
 		ContainerJSONBase: &types.ContainerJSONBase{
-			ID:   cont1ID,
-			Name: "/" + cont1Name,
+			ID:    cont1ID,
+			Name:  "/" + cont1Name,
 			State: &types.ContainerState{Running: true},
 		},
 		Config: &container.Config{
@@ -709,7 +710,8 @@ func TestContainerNameMatches_ProjectScoping(t *testing.T) {
 	is := is.New(t)
 
 	// Service-name match in a different project: rejected.
-	is.True(!containerNameMatches("redis-1", "projectA",
+	is.True(!containerNameMatches(
+		"redis-1", "projectA",
 		map[string]string{
 			composeServiceLabel: "redis-1",
 			composeProjectLabel: "projectB",
@@ -718,7 +720,8 @@ func TestContainerNameMatches_ProjectScoping(t *testing.T) {
 	))
 
 	// Service-name match in the same project: accepted.
-	is.True(containerNameMatches("redis-1", "projectA",
+	is.True(containerNameMatches(
+		"redis-1", "projectA",
 		map[string]string{
 			composeServiceLabel: "redis-1",
 			composeProjectLabel: "projectA",
@@ -727,7 +730,8 @@ func TestContainerNameMatches_ProjectScoping(t *testing.T) {
 	))
 
 	// Exact name match: project info is irrelevant.
-	is.True(containerNameMatches("/projectB-redis-1", "projectA",
+	is.True(containerNameMatches(
+		"/projectB-redis-1", "projectA",
 		map[string]string{
 			composeServiceLabel: "redis-1",
 			composeProjectLabel: "projectB",
@@ -737,13 +741,15 @@ func TestContainerNameMatches_ProjectScoping(t *testing.T) {
 
 	// No src project (e.g. non-compose deployment): still accept the
 	// service-name match.
-	is.True(containerNameMatches("redis-1", "",
+	is.True(containerNameMatches(
+		"redis-1", "",
 		map[string]string{composeServiceLabel: "redis-1"},
 		"/redis-1",
 	))
 
 	// No target project: also accept.
-	is.True(containerNameMatches("redis-1", "projectA",
+	is.True(containerNameMatches(
+		"redis-1", "projectA",
 		map[string]string{composeServiceLabel: "redis-1"},
 		"/redis-1",
 	))

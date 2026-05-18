@@ -362,8 +362,8 @@ var (
 	gatewayAddr = netip.MustParseAddr("172.0.1.1")
 	cont1Addr   = netip.MustParseAddr("172.0.1.2")
 	cont2Addr   = netip.MustParseAddr("172.0.1.3")
-	dstAddr  = netip.MustParseAddr("1.1.1.1")
-	dstRange = netipx.RangeOfPrefix(netip.MustParsePrefix("192.168.1.0/24"))
+	dstAddr     = netip.MustParseAddr("1.1.1.1")
+	dstRange    = netipx.RangeOfPrefix(netip.MustParsePrefix("192.168.1.0/24"))
 	lowDstAddr  = dstRange.From()
 	highDstAddr = dstRange.To()
 )
@@ -3369,14 +3369,16 @@ func compareRules(t *testing.T, comparer func(r1, r2 *nftables.Rule) bool, chain
 	}
 	for i := range expectedRules {
 		if !cmp.Equal(expectedRules[i], rules[i], cmp.Comparer(comparer)) {
-			t.Errorf("chain %s rule %d not equal:\n%s",
+			t.Errorf(
+				"chain %s rule %d not equal:\n%s",
 				chainName,
 				i,
 				cmp.Diff(expectedRules[i].Exprs, rules[i].Exprs),
 			)
 		}
 		if !bytes.Equal(expectedRules[i].UserData, rules[i].UserData) {
-			t.Errorf("chain %s rule %d user data not equal:\n%s",
+			t.Errorf(
+				"chain %s rule %d user data not equal:\n%s",
 				chainName,
 				i,
 				cmp.Diff(string(expectedRules[i].UserData), string(rules[i].UserData)),
