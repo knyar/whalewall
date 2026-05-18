@@ -20,14 +20,32 @@ func (r *RuleManager) containerExists(ctx context.Context, db database.Querier, 
 	return exists == 1, nil
 }
 
-func (r *RuleManager) addContainer(ctx context.Context, tx database.TX, id, name, service string, addrs map[string][]byte, estContainers map[string]struct{}) error {
+// syncContainerAddrs replaces the DB-tracked addrs for a container
+// with the given set. It deletes all existing rows for the container
+// and re-inserts the current ones so that subsequent lookups (e.g.
+// deleteContainerRules, the orphan sweep) see Docker's current state.
+//
+// Safe to call for both new and existing containers: for a new
+// container the delete is a no-op, and for an existing one it prunes
+// rows for addrs that no longer apply (e.g. after Docker reassigned
+// the container's IP across a restart).
+func syncContainerAddrs(ctx context.Context, tx database.TX, id string, addrs map[string][]byte) error {
+	if err := tx.DeleteContainerAddrs(ctx, id); err != nil {
+		return fmt.Errorf("error deleting container addrs from database: %w", err)
+	}
 	for _, addr := range addrs {
-		err := tx.AddContainerAddr(ctx, addr, id)
-		if err != nil {
+		if err := tx.AddContainerAddr(ctx, addr, id); err != nil {
 			return fmt.Errorf("error adding container addr to database: %w", err)
 		}
 	}
+	return nil
+}
 
+// addContainerInfo records container aliases and established-container
+// references, then commits the transaction. Only called for newly
+// created containers; addr reconciliation is handled separately by
+// syncContainerAddrs so it runs on every rule creation.
+func (r *RuleManager) addContainerInfo(ctx context.Context, tx database.TX, id, name, service string, estContainers map[string]struct{}) error {
 	// add names the container may have been referred to in user rules
 	// so when creating rules that specify this container it can be found
 	aliases := containerAliases(name, service)
