@@ -636,6 +636,12 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 				cfg.Output[i].IPs = []addrOrRange{
 					{addr: addr},
 				}
+				// Remember which container we picked so the matching
+				// createOutputRules call uses it for the est-chain
+				// rather than re-resolving by alias (which is project-
+				// blind and would defeat the cross-project guard).
+				cfg.Output[i].resolvedDstID = cont.ID
+				cfg.Output[i].resolvedDstName = stripName(cont.Name)
 				break
 			}
 
@@ -958,9 +964,19 @@ func (r *RuleManager) createOutputRules(ctx context.Context, nfc firewallClient,
 					continue
 				}
 
-				dstID, dstName, err := r.getContainerIDAndName(ctx, tx, ruleCfg.Container)
-				if err != nil {
-					return nil, fmt.Errorf("error getting container %q ID from database: %w", ruleCfg.Container, err)
+				// Prefer the dst container that populateOutputRules
+				// resolved with project-aware matching; only fall back
+				// to the alias lookup if those fields aren't set,
+				// which shouldn't happen in the normal flow but keeps
+				// us robust against future paths that bypass
+				// populateOutputRules.
+				dstID, dstName := ruleCfg.resolvedDstID, ruleCfg.resolvedDstName
+				if dstID == "" {
+					var err error
+					dstID, dstName, err = r.getContainerIDAndName(ctx, tx, ruleCfg.Container)
+					if err != nil {
+						return nil, fmt.Errorf("error getting container %q ID from database: %w", ruleCfg.Container, err)
+					}
 				}
 				rule.estChain = &nftables.Chain{
 					Table: filterTable,

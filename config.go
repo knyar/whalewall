@@ -47,6 +47,19 @@ type ruleConfig struct {
 	Verdict   verdict
 
 	skip bool
+
+	// resolvedDstID and resolvedDstName carry the id/name of the
+	// container that populateOutputRules picked for Container.
+	// createOutputRules uses these instead of looking up by alias
+	// in the DB (which is project-blind and would pick whichever
+	// container in any compose project registered the alias first,
+	// breaking the cross-project guard).
+	//
+	// These are unexported so gob omits them when populateOutputRules
+	// encodes the rule for the waiting-rules table — the receiving
+	// side resolves the dst differently and doesn't need them.
+	resolvedDstID   string
+	resolvedDstName string
 }
 
 func (r ruleConfig) MarshalLogObject(enc zapcore.ObjectEncoder) error {
