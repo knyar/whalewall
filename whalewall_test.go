@@ -643,6 +643,84 @@ output:
 			},
 		},
 		{
+			name: "allow port range ending at max port outbound",
+			containers: []types.ContainerJSON{
+				{
+					ContainerJSONBase: &types.ContainerJSONBase{
+						ID:   cont1ID,
+						Name: "/" + cont1Name,
+					},
+					Config: &container.Config{
+						Labels: map[string]string{
+							enabledLabel: "true",
+							rulesLabel: `
+output:
+  - proto: tcp
+    dst_ports:
+      - 80
+      - 420-65535`,
+						},
+					},
+					NetworkSettings: &types.NetworkSettings{
+						Networks: map[string]*network.EndpointSettings{
+							"default": {
+								Gateway:   gatewayAddr.String(),
+								IPAddress: cont1Addr.String(),
+							},
+						},
+					},
+				},
+			},
+			expectedRules: map[*nftables.Chain][]*nftables.Rule{
+				{
+					Name:  buildChainName(cont1Name, cont1ID),
+					Table: filterTable,
+				}: {
+					{
+						Exprs: slicesJoin(
+							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							[]expr.Any{
+								getPortExpr(dstPortOffset),
+								comparePortExpr(80),
+							},
+							comparePortsExprs(portInterval{420, 65535}),
+							matchConnStateExprs(stateNewEst),
+							[]expr.Any{
+								&expr.Counter{},
+								acceptVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					{
+						Exprs: slicesJoin(
+							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							[]expr.Any{
+								getPortExpr(srcPortOffset),
+								comparePortExpr(80),
+							},
+							comparePortsExprs(portInterval{420, 65535}),
+							matchConnStateExprs(stateEst),
+							[]expr.Any{
+								&expr.Counter{},
+								acceptVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					createDropRule(
+						&nftables.Chain{
+							Name:  buildChainName(cont1Name, cont1ID),
+							Table: filterTable,
+						},
+						cont1ID,
+					),
+				},
+			},
+		},
+		{
 			name: "allow HTTPS outbound to 1.1.1.1",
 			containers: []types.ContainerJSON{
 				{

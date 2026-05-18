@@ -1398,19 +1398,28 @@ func createPortExprs(nfc firewallClient, ports []rulePorts, portOffset uint32, c
 	}
 
 	var portRange portInterval
+	var maxPortRange portInterval
+	var hasMaxPortRange bool
 	var portIntervalElems []nftables.SetElement
 	for _, port := range ports {
 		if port.single == 0 {
-			portRange = port.interval
-			portIntervalElems = append(portIntervalElems, nftables.SetElement{
-				Key: binary.BigEndian.AppendUint16(nil, port.interval.min),
-			})
-			// nftables interval sets use half-open intervals [start, end),
-			// so the end element must be one past the max port
-			portIntervalElems = append(portIntervalElems, nftables.SetElement{
-				Key:         binary.BigEndian.AppendUint16(nil, port.interval.max+1),
-				IntervalEnd: true,
-			})
+			if port.interval.max < ^uint16(0) {
+				portRange = port.interval
+				portIntervalElems = append(portIntervalElems, nftables.SetElement{
+					Key: binary.BigEndian.AppendUint16(nil, port.interval.min),
+				})
+				// nftables interval sets use half-open intervals [start, end),
+				// so the end element must be one past the max port
+				portIntervalElems = append(portIntervalElems, nftables.SetElement{
+					Key:         binary.BigEndian.AppendUint16(nil, port.interval.max+1),
+					IntervalEnd: true,
+				})
+			} else {
+				// max==65535: adding 1 would overflow uint16; use closed-range
+				// comparisons via comparePortsExprs instead of an interval set
+				maxPortRange = port.interval
+				hasMaxPortRange = true
+			}
 		}
 	}
 	if len(portIntervalElems) != 0 {
@@ -1430,6 +1439,9 @@ func createPortExprs(nfc firewallClient, ports []rulePorts, portOffset uint32, c
 			}
 			exprs = append(exprs, matchFromSetExpr(set))
 		}
+	}
+	if hasMaxPortRange {
+		exprs = append(exprs, comparePortsExprs(maxPortRange)...)
 	}
 
 	if len(exprs) == 1 {
