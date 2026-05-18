@@ -481,8 +481,10 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 	// event-driven cleanup (and the periodic orphan sweep) can find
 	// every tracked addr that needs removing. Runs for both new and
 	// existing containers — the latter is how stale rows from an IP
-	// change get pruned.
-	if err := syncContainerAddrs(ctx, tx, container.ID, addrs); err != nil {
+	// change get pruned. hasStale was computed against the pre-tx
+	// DB read above; passing it through lets syncContainerAddrs skip
+	// the DELETE when there's nothing to remove (the common case).
+	if err := syncContainerAddrs(ctx, tx, container.ID, addrs, len(staleAddrs) > 0); err != nil {
 		return err
 	}
 

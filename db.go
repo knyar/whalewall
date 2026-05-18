@@ -20,18 +20,19 @@ func (r *RuleManager) containerExists(ctx context.Context, db database.Querier, 
 	return exists == 1, nil
 }
 
-// syncContainerAddrs replaces the DB-tracked addrs for a container
-// with the given set. It deletes all existing rows for the container
-// and re-inserts the current ones so that subsequent lookups (e.g.
-// deleteContainerRules, the orphan sweep) see Docker's current state.
-//
-// Safe to call for both new and existing containers: for a new
-// container the delete is a no-op, and for an existing one it prunes
-// rows for addrs that no longer apply (e.g. after Docker reassigned
-// the container's IP across a restart).
-func syncContainerAddrs(ctx context.Context, tx database.TX, id string, addrs map[string][]byte) error {
-	if err := tx.DeleteContainerAddrs(ctx, id); err != nil {
-		return fmt.Errorf("error deleting container addrs from database: %w", err)
+// syncContainerAddrs reconciles the DB-tracked addrs for a container
+// with the given set. When hasStale is true (the caller's prior read
+// turned up rows that are no longer in the current set), all
+// existing rows for the container are deleted first; otherwise only
+// INSERT OR REPLACE is issued for the current addrs. Skipping the
+// delete in the common case keeps the transaction's SQLite write-
+// lock window short, which reduces contention against concurrent
+// deleteContainerRules / clearRules calls that happen in tests.
+func syncContainerAddrs(ctx context.Context, tx database.TX, id string, addrs map[string][]byte, hasStale bool) error {
+	if hasStale {
+		if err := tx.DeleteContainerAddrs(ctx, id); err != nil {
+			return fmt.Errorf("error deleting container addrs from database: %w", err)
+		}
 	}
 	for _, addr := range addrs {
 		if err := tx.AddContainerAddr(ctx, addr, id); err != nil {
