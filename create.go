@@ -1311,21 +1311,34 @@ func createIPExprs(nfc firewallClient, addrs []addrOrRange, addrOffset uint32, c
 
 	var addrRangeLow []byte
 	var addrRangeHigh []byte
+	var maxAddrRangeLow []byte
+	var maxAddrRangeHigh []byte
+	var hasMaxAddrRange bool
 	var addrRangeElems []nftables.SetElement
 	for _, addr := range addrs {
 		if lowAddr, highAddr, ok := addr.Range(); ok {
 			addrRangeLow = ref(lowAddr.As4())[:]
 			addrRangeHigh = ref(highAddr.As4())[:]
-			addrRangeElems = append(addrRangeElems, nftables.SetElement{
-				Key: addrRangeLow,
-			})
-			// nftables interval sets use half-open intervals [start, end),
-			// so the end element must be one past the high address
-			endAddr := highAddr.Next()
-			addrRangeElems = append(addrRangeElems, nftables.SetElement{
-				Key:         ref(endAddr.As4())[:],
-				IntervalEnd: true,
-			})
+			// Check if highAddr is the max IPv4 address (255.255.255.255)
+			// highAddr.Next() would return an invalid Addr, and As4() would panic
+			if highAddr.Compare(netip.AddrFrom4([4]byte{255, 255, 255, 255})) < 0 {
+				addrRangeElems = append(addrRangeElems, nftables.SetElement{
+					Key: addrRangeLow,
+				})
+				// nftables interval sets use half-open intervals [start, end),
+				// so the end element must be one past the high address
+				endAddr := highAddr.Next()
+				addrRangeElems = append(addrRangeElems, nftables.SetElement{
+					Key:         ref(endAddr.As4())[:],
+					IntervalEnd: true,
+				})
+			} else {
+				// highAddr==255.255.255.255: Next() returns invalid Addr; use closed-range
+				// comparisons via compareAddrRangeExprs instead of an interval set
+				maxAddrRangeLow = addrRangeLow
+				maxAddrRangeHigh = addrRangeHigh
+				hasMaxAddrRange = true
+			}
 		}
 	}
 	if len(addrRangeElems) != 0 {
@@ -1346,6 +1359,9 @@ func createIPExprs(nfc firewallClient, addrs []addrOrRange, addrOffset uint32, c
 			}
 			exprs = append(exprs, matchFromSetExpr(set))
 		}
+	}
+	if hasMaxAddrRange {
+		exprs = append(exprs, compareAddrRangeExprs(maxAddrRangeLow, maxAddrRangeHigh)...)
 	}
 
 	if len(exprs) == 1 {
