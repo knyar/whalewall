@@ -51,9 +51,13 @@ func (r *RuleManager) syncContainers(ctx context.Context) error {
 			// we are aware of the container and have created rules for
 			// it before, but the rules could have been deleted since
 			// then so recreate any missing rules
-			r.createCh <- containerDetails{
+			select {
+			case r.createCh <- containerDetails{
 				container: container,
 				isNew:     false,
+			}:
+			case <-r.stopping:
+				return nil
 			}
 			continue
 		}
@@ -64,9 +68,13 @@ func (r *RuleManager) syncContainers(ctx context.Context) error {
 			continue
 		}
 		if enabled {
-			r.createCh <- containerDetails{
+			select {
+			case r.createCh <- containerDetails{
 				container: container,
 				isNew:     true,
+			}:
+			case <-r.stopping:
+				return nil
 			}
 		}
 	}

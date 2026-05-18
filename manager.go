@@ -160,13 +160,21 @@ func (r *RuleManager) Start(ctx context.Context) error {
 							r.logger.Error("error inspecting container", zap.String("container.id", msg.ID), zap.Error(err))
 							continue
 						}
-						r.createCh <- containerDetails{
+						select {
+						case r.createCh <- containerDetails{
 							container: container,
 							isNew:     true,
+						}:
+						case <-r.stopping:
+							return
 						}
 					}
 					if msg.Action == "die" {
-						r.deleteCh <- msg.ID
+						select {
+						case r.deleteCh <- msg.ID:
+						case <-r.stopping:
+							return
+						}
 					}
 				}
 			case err := <-streamErrs:
@@ -189,8 +197,6 @@ func (r *RuleManager) Start(ctx context.Context) error {
 
 				messages, streamErrs = addFilters(ctx, r.dockerCli)
 			case <-r.stopping:
-				close(r.createCh)
-				close(r.deleteCh)
 				return
 			}
 		}
@@ -302,6 +308,10 @@ func (r *RuleManager) Done() <-chan struct{} {
 func (r *RuleManager) Stop() {
 	close(r.stopping)
 	r.wg.Wait()
+
+	// Close channels after all goroutines that might send on them have finished
+	close(r.createCh)
+	close(r.deleteCh)
 
 	if err := r.dockerCli.Close(); err != nil {
 		r.logger.Error("error closing docker client", zap.Error(err))

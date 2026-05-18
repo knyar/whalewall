@@ -867,6 +867,87 @@ output:
 			},
 		},
 		{
+			name: "allow outbound to IP range ending at max address",
+			containers: []types.ContainerJSON{
+				{
+					ContainerJSONBase: &types.ContainerJSONBase{
+						ID:   cont1ID,
+						Name: "/" + cont1Name,
+					},
+					Config: &container.Config{
+						Labels: map[string]string{
+							enabledLabel: "true",
+							rulesLabel: `
+output:
+  - ips:
+      - 255.255.255.0-255.255.255.255
+    proto: tcp
+    dst_ports:
+      - 443`,
+						},
+					},
+					NetworkSettings: &types.NetworkSettings{
+						Networks: map[string]*network.EndpointSettings{
+							"default": {
+								Gateway:   gatewayAddr.String(),
+								IPAddress: cont1Addr.String(),
+							},
+						},
+					},
+				},
+			},
+			expectedRules: map[*nftables.Chain][]*nftables.Rule{
+				{
+					Name:  buildChainName(cont1Name, cont1ID),
+					Table: filterTable,
+				}: {
+					{
+						Exprs: slicesJoin(
+							matchAddrExprs(ref(cont1Addr.As4())[:], srcAddrOffset),
+							matchAddrRangeExprs(
+								netip.MustParseAddr("255.255.255.0"),
+								netip.MustParseAddr("255.255.255.255"),
+								dstAddrOffset,
+							),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							matchPortExprs(443, dstPortOffset),
+							matchConnStateExprs(stateNewEst),
+							[]expr.Any{
+								&expr.Counter{},
+								acceptVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					{
+						Exprs: slicesJoin(
+							matchAddrRangeExprs(
+								netip.MustParseAddr("255.255.255.0"),
+								netip.MustParseAddr("255.255.255.255"),
+								srcAddrOffset,
+							),
+							matchAddrExprs(ref(cont1Addr.As4())[:], dstAddrOffset),
+							matchProtoExprs(unix.IPPROTO_TCP),
+							matchPortExprs(443, srcPortOffset),
+							matchConnStateExprs(stateEst),
+							[]expr.Any{
+								&expr.Counter{},
+								acceptVerdict,
+							},
+						),
+						UserData: []byte(cont1ID),
+					},
+					createDropRule(
+						&nftables.Chain{
+							Name:  buildChainName(cont1Name, cont1ID),
+							Table: filterTable,
+						},
+						cont1ID,
+					),
+				},
+			},
+		},
+		{
 			name: "allow DNS outbound to 2 IPs",
 			containers: []types.ContainerJSON{
 				{
