@@ -700,10 +700,11 @@ func TestCleanupOrphanedMapEntries(t *testing.T) {
 }
 
 // TestContainerNameMatches_ProjectScoping covers the cross-project
-// guard: when matching by Docker Compose service name, the src and
-// target must share a project. Exact-name matches still work across
-// projects, and the absence of project info preserves the original
-// permissive behavior.
+// guard. The cross-project guard is asymmetric on the source: a
+// non-compose source (no project label) is allowed to match any
+// service name; a compose source must share its project with the
+// target. A target with a service label but no project label is
+// treated as suspect and rejected when the source has a project.
 func TestContainerNameMatches_ProjectScoping(t *testing.T) {
 	t.Parallel()
 
@@ -740,17 +741,133 @@ func TestContainerNameMatches_ProjectScoping(t *testing.T) {
 	))
 
 	// No src project (e.g. non-compose deployment): still accept the
-	// service-name match.
+	// service-name match against any target.
 	is.True(containerNameMatches(
 		"redis-1", "",
 		map[string]string{composeServiceLabel: "redis-1"},
 		"/redis-1",
 	))
 
-	// No target project: also accept.
-	is.True(containerNameMatches(
+	// Src has a project but the target has only a service label
+	// (no project): rejected. A bare service label without a paired
+	// project is not normal Docker Compose output and should not be
+	// matched cross-project. The target's container name doesn't
+	// match expectedName, so the check falls through to the
+	// service-label path.
+	is.True(!containerNameMatches(
 		"redis-1", "projectA",
 		map[string]string{composeServiceLabel: "redis-1"},
-		"/redis-1",
+		"/manually-started-redis",
 	))
+}
+
+// TestSweepDoesNotDeleteFreshlyCreatedAddrs verifies the invariant
+// the orphan sweep relies on: createContainerRules installs a
+// container's map entries only after its DB transaction has committed.
+// We exercise this by running the full sweep immediately after
+// createContainerRules returns; if the ordering were wrong, the sweep
+// could observe the new map entry before its DB row landed and delete
+// it as orphaned.
+func TestSweepDoesNotDeleteFreshlyCreatedAddrs(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	cont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:    cont1ID,
+			Name:  "/" + cont1Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{enabledLabel: "true"},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont1Addr.String(),
+				},
+			},
+		},
+	}
+	dockerCli.containers = append(dockerCli.containers, cont)
+
+	err := r.createContainerRules(context.Background(), cont, true)
+	is.NoErr(err)
+
+	// Run the orphan sweep right after creation: under the
+	// DB-then-map ordering invariant, the addr is in both the DB
+	// and the map, so the sweep must leave it alone.
+	err = r.cleanupOrphanedMapEntries(context.Background())
+	is.NoErr(err)
+
+	nfc, err := r.newFirewallClient()
+	is.NoErr(err)
+	elements, err := nfc.GetSetElements(containerAddrSet)
+	is.NoErr(err)
+	is.True(containsAddr(elements, cont1Addr)) // addr should survive the sweep
+
+	// And the DB should still know about it.
+	tracked, err := r.db.GetContainerAddrs(context.Background(), cont1ID)
+	is.NoErr(err)
+	is.True(len(tracked) == 1)
+	is.True(bytes.Equal(tracked[0], ref(cont1Addr.As4())[:]))
+}
+
+// TestStaleAddrFlushedFromMapAfterCommit verifies that the stale-addr
+// removal also runs after the DB tx commits. We seed an isNew=true
+// container, simulate Docker reassigning its IP, re-process, and check
+// that both the map and DB only reflect the new IP — and that the
+// orphan sweep is consistent with the per-container reconciliation.
+func TestStaleAddrFlushedFromMapAfterCommit(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	oldAddr := cont1Addr
+	newAddr := netip.MustParseAddr("172.0.1.77")
+
+	cont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:    cont1ID,
+			Name:  "/" + cont1Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{enabledLabel: "true"},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: oldAddr.String(),
+				},
+			},
+		},
+	}
+	dockerCli.containers = append(dockerCli.containers, cont)
+	is.NoErr(r.createContainerRules(context.Background(), cont, true))
+
+	dockerCli.mtx.Lock()
+	dockerCli.containers[0].NetworkSettings.Networks["default"].IPAddress = newAddr.String()
+	dockerCli.mtx.Unlock()
+
+	updated := dockerCli.containers[0]
+	is.NoErr(r.createContainerRules(context.Background(), updated, false))
+
+	// Run the orphan sweep — old addr is no longer in DB after the
+	// reconciliation in createContainerRules, but we also removed
+	// it from the map in the same post-commit step, so the sweep
+	// has nothing to clean up.
+	is.NoErr(r.cleanupOrphanedMapEntries(context.Background()))
+
+	nfc, err := r.newFirewallClient()
+	is.NoErr(err)
+	elements, err := nfc.GetSetElements(containerAddrSet)
+	is.NoErr(err)
+	is.True(containsAddr(elements, newAddr))
+	is.True(!containsAddr(elements, oldAddr))
 }

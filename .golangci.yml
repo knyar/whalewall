@@ -38,6 +38,11 @@ linters:
     errcheck:
       exclude-functions:
         - (go.uber.org/zap/zapcore.ObjectEncoder).AddObject
+    goconst:
+      # Test fixtures inline strings like "default", "true", port specs
+      # repeatedly for readability — extracting them to constants would
+      # obscure each test case's intent.
+      ignore-tests: true
     misspell:
       locale: US
     paralleltest:
