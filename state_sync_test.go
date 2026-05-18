@@ -1,6 +1,7 @@
 package whalewall
 
 import (
+	"bytes"
 	"context"
 	"net/netip"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"github.com/matryer/is"
 	"go.uber.org/zap"
 )
@@ -537,4 +539,212 @@ func TestSyncStateTwoContainers(t *testing.T) {
 	expectedAddr := ref(netip.MustParseAddr("172.0.1.3").As4())[:]
 	is.True(len(addrs) == 1)
 	is.True(string(addrs[0]) == string(expectedAddr)) // container2 addr should be intact
+}
+
+// containsAddr returns true if the addr is present as the key of any
+// element in elements.
+func containsAddr(elements []nftables.SetElement, addr netip.Addr) bool {
+	key := ref(addr.As4())[:]
+	for _, e := range elements {
+		if bytes.Equal(e.Key, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestStaleAddrCleanedOnIPChange exercises the bug from the field
+// report: a container kept its ID but Docker reassigned its IP. The
+// map should end up with only the current IP after a re-sync, and the
+// DB should reflect the same.
+func TestStaleAddrCleanedOnIPChange(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	oldAddr := cont1Addr
+	newAddr := netip.MustParseAddr("172.0.1.42")
+
+	cont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:   cont1ID,
+			Name: "/" + cont1Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{enabledLabel: "true"},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: oldAddr.String(),
+				},
+			},
+		},
+	}
+	dockerCli.containers = append(dockerCli.containers, cont)
+	err := r.createContainerRules(context.Background(), cont, true)
+	is.NoErr(err)
+
+	// Sanity check: old addr tracked in DB and in map.
+	tracked, err := r.db.GetContainerAddrs(context.Background(), cont1ID)
+	is.NoErr(err)
+	is.True(len(tracked) == 1)
+	is.True(bytes.Equal(tracked[0], ref(oldAddr.As4())[:]))
+
+	nfc, err := r.newFirewallClient()
+	is.NoErr(err)
+	elements, err := nfc.GetSetElements(containerAddrSet)
+	is.NoErr(err)
+	is.True(containsAddr(elements, oldAddr))
+
+	// Docker reassigns the IP (e.g. after a restart) but keeps the
+	// container ID the same. The next sync iteration will invoke
+	// createContainerRules with isNew=false.
+	dockerCli.mtx.Lock()
+	dockerCli.containers[0].NetworkSettings.Networks["default"].IPAddress = newAddr.String()
+	dockerCli.mtx.Unlock()
+
+	updated := dockerCli.containers[0]
+	err = r.createContainerRules(context.Background(), updated, false)
+	is.NoErr(err)
+
+	// DB should now track only the new addr.
+	tracked, err = r.db.GetContainerAddrs(context.Background(), cont1ID)
+	is.NoErr(err)
+	is.True(len(tracked) == 1)
+	is.True(bytes.Equal(tracked[0], ref(newAddr.As4())[:]))
+
+	// Map should have the new addr and not the old one.
+	nfc, err = r.newFirewallClient()
+	is.NoErr(err)
+	elements, err = nfc.GetSetElements(containerAddrSet)
+	is.NoErr(err)
+	is.True(containsAddr(elements, newAddr))
+	is.True(!containsAddr(elements, oldAddr))
+}
+
+// TestCleanupOrphanedMapEntries verifies the periodic-sync safety net:
+// map entries whose IP isn't tracked by any container in the DB get
+// removed, while legitimate entries are left alone.
+func TestCleanupOrphanedMapEntries(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	// One real container — its addr should survive the sweep.
+	cont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:   cont1ID,
+			Name: "/" + cont1Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{enabledLabel: "true"},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont1Addr.String(),
+				},
+			},
+		},
+	}
+	dockerCli.containers = append(dockerCli.containers, cont)
+	err := r.createContainerRules(context.Background(), cont, true)
+	is.NoErr(err)
+
+	// Inject an orphan map entry directly: this simulates state left
+	// behind by a crash, an upgrade, or any code path that bypassed
+	// the per-container reconciliation. Use a fresh firewall client
+	// so its local clone has the containerAddrSet that was created
+	// by createBaseRules.
+	orphanAddr := netip.MustParseAddr("172.0.1.123")
+	injector, err := r.newFirewallClient()
+	is.NoErr(err)
+	err = injector.SetAddElements(containerAddrSet, []nftables.SetElement{
+		{
+			Key: ref(orphanAddr.As4())[:],
+			VerdictData: &expr.Verdict{
+				Kind:  expr.VerdictJump,
+				Chain: "whalewall-some-removed-chain",
+			},
+		},
+	})
+	is.NoErr(err)
+	is.NoErr(injector.Flush())
+
+	// Both should now be present in the map.
+	nfc, err := r.newFirewallClient()
+	is.NoErr(err)
+	elements, err := nfc.GetSetElements(containerAddrSet)
+	is.NoErr(err)
+	is.True(containsAddr(elements, cont1Addr))
+	is.True(containsAddr(elements, orphanAddr))
+
+	err = r.cleanupOrphanedMapEntries(context.Background())
+	is.NoErr(err)
+
+	// Orphan gone, legitimate entry untouched.
+	nfc, err = r.newFirewallClient()
+	is.NoErr(err)
+	elements, err = nfc.GetSetElements(containerAddrSet)
+	is.NoErr(err)
+	is.True(containsAddr(elements, cont1Addr))
+	is.True(!containsAddr(elements, orphanAddr))
+}
+
+// TestContainerNameMatches_ProjectScoping covers the cross-project
+// guard: when matching by Docker Compose service name, the src and
+// target must share a project. Exact-name matches still work across
+// projects, and the absence of project info preserves the original
+// permissive behavior.
+func TestContainerNameMatches_ProjectScoping(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+
+	// Service-name match in a different project: rejected.
+	is.True(!containerNameMatches("redis-1", "projectA",
+		map[string]string{
+			composeServiceLabel: "redis-1",
+			composeProjectLabel: "projectB",
+		},
+		"/projectB-redis-1",
+	))
+
+	// Service-name match in the same project: accepted.
+	is.True(containerNameMatches("redis-1", "projectA",
+		map[string]string{
+			composeServiceLabel: "redis-1",
+			composeProjectLabel: "projectA",
+		},
+		"/projectA-redis-1",
+	))
+
+	// Exact name match: project info is irrelevant.
+	is.True(containerNameMatches("/projectB-redis-1", "projectA",
+		map[string]string{
+			composeServiceLabel: "redis-1",
+			composeProjectLabel: "projectB",
+		},
+		"/projectB-redis-1",
+	))
+
+	// No src project (e.g. non-compose deployment): still accept the
+	// service-name match.
+	is.True(containerNameMatches("redis-1", "",
+		map[string]string{composeServiceLabel: "redis-1"},
+		"/redis-1",
+	))
+
+	// No target project: also accept.
+	is.True(containerNameMatches("redis-1", "projectA",
+		map[string]string{composeServiceLabel: "redis-1"},
+		"/redis-1",
+	))
 }

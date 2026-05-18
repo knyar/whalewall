@@ -3,6 +3,8 @@ package whalewall
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"syscall"
 	"time"
@@ -20,7 +22,10 @@ const defaultSyncInterval = 30 * time.Second
 // that no longer exist in Docker, and removes orphaned nftables chains with the
 // "whalewall-" prefix that don't correspond to any running container.
 func (r *RuleManager) syncState(ctx context.Context) {
-	r.logger.Info("syncing state with running containers")
+	// Logged at Debug because this fires every defaultSyncInterval
+	// even when nothing changes. The per-action helpers below log at
+	// Info only when they actually find something to clean up.
+	r.logger.Debug("syncing state with running containers")
 
 	if err := r.cleanupStaleDBEntries(ctx); err != nil {
 		r.logger.Error("error cleaning up stale database entries", zap.Error(err))
@@ -28,6 +33,10 @@ func (r *RuleManager) syncState(ctx context.Context) {
 
 	if err := r.cleanupOrphanedChains(ctx); err != nil {
 		r.logger.Error("error cleaning up orphaned nftables chains", zap.Error(err))
+	}
+
+	if err := r.cleanupOrphanedMapEntries(ctx); err != nil {
+		r.logger.Error("error cleaning up orphaned map entries", zap.Error(err))
 	}
 }
 
@@ -334,6 +343,76 @@ func deleteRulesJumpingToChain(logger *zap.Logger, nfc firewallClient, rules []*
 			}
 		}
 	}
+}
+
+// cleanupOrphanedMapEntries removes elements from the container address
+// jump map (whalewall-container-addrs) whose IP is not tracked by any
+// container in the database. Per-container reconciliation in
+// createContainerRules handles the common case (IP change during a
+// container's lifetime), but a map entry can still be left dangling
+// after a crash mid-operation, an upgrade from an older whalewall
+// version that didn't track addrs, or any other path that bypassed the
+// normal cleanup. Without this sweep such entries would silently
+// misroute traffic to a stale chain forever.
+func (r *RuleManager) cleanupOrphanedMapEntries(ctx context.Context) error {
+	nfc, err := r.newFirewallClient()
+	if err != nil {
+		return err
+	}
+
+	elements, err := nfc.GetSetElements(containerAddrSet)
+	if err != nil {
+		// The set hasn't been created yet (first run before
+		// createBaseRules) — nothing to do.
+		if errors.Is(err, syscall.ENOENT) {
+			return nil
+		}
+		return fmt.Errorf("error getting container address set elements: %w", err)
+	}
+	if len(elements) == 0 {
+		return nil
+	}
+
+	containers, err := r.db.GetContainers(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting containers from database: %w", err)
+	}
+	knownAddrs := make(map[string]struct{})
+	for _, c := range containers {
+		addrs, err := r.db.GetContainerAddrs(ctx, c.ID)
+		if err != nil {
+			r.logger.Error("sync: error getting container addrs",
+				zap.String("container.id", c.ID[:12]),
+				zap.Error(err),
+			)
+			continue
+		}
+		for _, a := range addrs {
+			knownAddrs[string(a)] = struct{}{}
+		}
+	}
+
+	var orphaned []nftables.SetElement
+	for _, elem := range elements {
+		if _, ok := knownAddrs[string(elem.Key)]; ok {
+			continue
+		}
+		orphaned = append(orphaned, nftables.SetElement{Key: elem.Key})
+	}
+	if len(orphaned) == 0 {
+		return nil
+	}
+
+	r.logger.Info("sync: removing orphaned container address map entries",
+		zap.Int("count", len(orphaned)),
+	)
+	if err := nfc.SetDeleteElements(containerAddrSet, orphaned); err != nil {
+		return fmt.Errorf("error queuing orphaned map element deletion: %w", err)
+	}
+	if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
+		return fmt.Errorf("error deleting orphaned map elements: %w", err)
+	}
+	return nil
 }
 
 // startPeriodicSync runs syncState periodically until the manager is stopped.

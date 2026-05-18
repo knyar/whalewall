@@ -122,7 +122,13 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 
 	contName := stripName(container.Name)
 	logger := r.logger.With(zap.String("container.id", container.ID[:12]), zap.String("container.name", contName))
-	logger.Info("creating rules", zap.Bool("container.is_new", isNew))
+	// Demote periodic re-syncs (isNew=false) to Debug so the 30s
+	// sync loop doesn't flood the logs when nothing has changed.
+	if isNew {
+		logger.Info("creating rules", zap.Bool("container.is_new", isNew))
+	} else {
+		logger.Debug("creating rules", zap.Bool("container.is_new", isNew))
+	}
 
 	// check that network settings are valid
 	if container.NetworkSettings == nil {
@@ -176,6 +182,43 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 	nfc.AddChain(chain)
 	if err := ignoringErr(nfc.Flush, syscall.EEXIST); err != nil {
 		return fmt.Errorf("error creating chain: %w", err)
+	}
+
+	// Look up addrs previously tracked in the DB so we can detect
+	// stale entries (e.g. the container restarted and Docker
+	// reassigned a different IP). These must be removed from the
+	// jump map so traffic to the old IP doesn't get misrouted into
+	// this container's chain.
+	var staleAddrs [][]byte
+	if !isNew {
+		trackedAddrs, err := r.db.GetContainerAddrs(ctx, container.ID)
+		if err != nil {
+			return fmt.Errorf("error getting tracked addrs from database: %w", err)
+		}
+		currentAddrSet := make(map[string]struct{}, len(addrs))
+		for _, addr := range addrs {
+			currentAddrSet[string(addr)] = struct{}{}
+		}
+		for _, addr := range trackedAddrs {
+			if _, ok := currentAddrSet[string(addr)]; !ok {
+				staleAddrs = append(staleAddrs, addr)
+			}
+		}
+	}
+
+	if len(staleAddrs) > 0 {
+		logger.Info("removing stale addrs from container address map",
+			zap.Int("count", len(staleAddrs)),
+		)
+		staleElems := make([]nftables.SetElement, 0, len(staleAddrs))
+		for _, addr := range staleAddrs {
+			staleElems = append(staleElems, nftables.SetElement{Key: addr})
+		}
+		if err := nfc.SetDeleteElements(containerAddrSet, staleElems); err != nil {
+			logger.Error("error queuing stale addr removal", zap.Error(err))
+		} else if err := ignoringErr(nfc.Flush, syscall.ENOENT); err != nil {
+			logger.Error("error removing stale addrs from set", zap.Error(err))
+		}
 	}
 
 	// add container IPs to jump set so traffic to/from this
@@ -447,13 +490,22 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		}
 	}
 
+	// Reconcile the addrs table to the current Docker state so future
+	// event-driven cleanup (and the periodic orphan sweep) can find
+	// every tracked addr that needs removing. Runs for both new and
+	// existing containers — the latter is how stale rows from an IP
+	// change get pruned.
+	if err := syncContainerAddrs(ctx, tx, container.ID, addrs); err != nil {
+		return err
+	}
+
 	if !isNew {
-		return nil
+		return tx.Commit()
 	}
 
 	logger.Debug("adding to database")
 
-	if err := r.addContainer(ctx, tx, container.ID, contName, service, addrs, estContainers); err != nil {
+	if err := r.addContainerInfo(ctx, tx, container.ID, contName, service, estContainers); err != nil {
 		return fmt.Errorf("error adding container information to database: %w", err)
 	}
 
@@ -502,7 +554,7 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 			// network
 			var found bool
 			for _, listedCont := range listedConts {
-				if !containerNameMatches(ruleCfg.Container, listedCont.Labels, listedCont.Names...) {
+				if !containerNameMatches(ruleCfg.Container, project, listedCont.Labels, listedCont.Names...) {
 					continue
 				}
 
@@ -609,7 +661,14 @@ func findNetwork[T any](network, project string, addrs map[string]T) (string, T,
 
 // containerNameMatches returns true if a canonical container name can
 // be found from a combination of labels and names.
-func containerNameMatches(expectedName string, labels map[string]string, names ...string) bool {
+//
+// When matching by Docker Compose service name, srcProject (the
+// compose project of the container that issued the rule) must match
+// the target's project label. This avoids treating a generic service
+// name like "redis-1" as a match across unrelated compose projects.
+// If either side lacks a compose project label the match is allowed,
+// preserving behavior for non-compose deployments.
+func containerNameMatches(expectedName, srcProject string, labels map[string]string, names ...string) bool {
 	if len(expectedName) == 0 {
 		return false
 	}
@@ -630,6 +689,10 @@ func containerNameMatches(expectedName string, labels map[string]string, names .
 	}
 	// check if the Docker Compose service name matches
 	if serviceName, ok := labels[composeServiceLabel]; ok && serviceName == expectedName {
+		targetProject := labels[composeProjectLabel]
+		if srcProject != "" && targetProject != "" && srcProject != targetProject {
+			return false
+		}
 		return true
 	}
 
@@ -920,19 +983,43 @@ func (r *RuleManager) getContainerIDAndName(ctx context.Context, db database.Que
 func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firewallClient, logger *zap.Logger, tx database.TX, id, name, service, project string, addrs map[string][]byte, chain *nftables.Chain, estContainers map[string]struct{}) ([]*nftables.Rule, error) {
 	var (
 		waitingRules []database.GetWaitingContainerRulesRow
-		err          error
 		aliases      = append([]string{name}, containerAliases(name, service)...)
 	)
 
 	for _, alias := range aliases {
-		waitingRules, err = tx.GetWaitingContainerRules(ctx, alias)
+		rules, err := tx.GetWaitingContainerRules(ctx, alias)
 		if err != nil {
 			return nil, fmt.Errorf("error getting waiting container rules of %q from database: %w", alias, err)
 		}
 
-		if len(waitingRules) == 0 {
+		// When matching by a service-name alias (anything other than
+		// this container's own name), drop rules whose src container
+		// belongs to a different compose project. Otherwise a generic
+		// service name like "redis-1" would attract waiting rules
+		// from servers in unrelated projects, creating cross-project
+		// firewall rules that flap with each sync iteration.
+		if alias != name && alias != "/"+name && len(rules) > 0 {
+			filtered := make([]database.GetWaitingContainerRulesRow, 0, len(rules))
+			for _, wr := range rules {
+				srcCont, err := r.dockerCli.ContainerInspect(ctx, wr.SrcContainerID)
+				if err != nil {
+					// src container is gone; skip — it will be
+					// cleaned up when the stale entry is detected.
+					continue
+				}
+				srcProject := srcCont.Config.Labels[composeProjectLabel]
+				if srcProject != "" && project != "" && srcProject != project {
+					continue
+				}
+				filtered = append(filtered, wr)
+			}
+			rules = filtered
+		}
+
+		if len(rules) == 0 {
 			continue
 		}
+		waitingRules = rules
 		break
 	}
 	if waitingRules == nil {
