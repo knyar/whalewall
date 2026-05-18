@@ -205,7 +205,7 @@ func startWhalewall(t *testing.T, is *is.I, tempDir string) func() {
 func startBinary(t *testing.T, is *is.I, tempDir string) func() {
 	t.Helper()
 
-	wwCmd := exec.Command(*whalewallBinary, "-debug", "-d", tempDir)
+	wwCmd := exec.CommandContext(context.Background(), *whalewallBinary, "-debug", "-d", tempDir)
 	wwCmd.Stdout = os.Stdout
 	wwCmd.Stderr = os.Stderr
 	err := wwCmd.Start()
@@ -229,7 +229,8 @@ func startBinary(t *testing.T, is *is.I, tempDir string) func() {
 func startContainer(t *testing.T, is *is.I, tempDir string) func() {
 	t.Helper()
 
-	dockerCmd := exec.Command(
+	dockerCmd := exec.CommandContext(
+		context.Background(),
 		"docker",
 		"run",
 		"--cap-add=NET_ADMIN",
@@ -318,7 +319,7 @@ func run(t *testing.T, args ...string) int {
 
 	t.Logf("running %v", args)
 
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.CommandContext(context.Background(), args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
@@ -3344,6 +3345,13 @@ mapped_ports:
 	// state. On the next createContainerRules call, some rules in
 	// the port map batch will exist and others won't, triggering
 	// partial deduplication with orphaned anonymous sets.
+	//
+	// Refresh mfc's local view from the base firewall first: the
+	// container chain was created via a separate nfc instance (from
+	// r.newFirewallClient), so mfc.chains hasn't yet seen it. Flush
+	// on a mockFirewall always re-clones from base in its defer,
+	// regardless of whether there were local changes.
+	is.NoErr(mfc.Flush())
 	err = mfc.DelRule(rules[0])
 	is.NoErr(err)
 	is.NoErr(mfc.Flush())

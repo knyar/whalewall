@@ -183,7 +183,7 @@ func TestCleanupStaleDBEntries_StoppedContainer(t *testing.T) {
 
 	// Stop the container (keep it in Docker but not running).
 	dockerCli.mtx.Lock()
-	dockerCli.containers[0].ContainerJSONBase.State = &types.ContainerState{
+	dockerCli.containers[0].State = &types.ContainerState{
 		Running: false,
 	}
 	dockerCli.mtx.Unlock()
