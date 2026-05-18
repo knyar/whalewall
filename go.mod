@@ -2,6 +2,15 @@ module github.com/capnspacehook/whalewall
 
 go 1.22.4
 
+// CI workflows install tools (staticcheck, goda) via `go install
+// @latest`, and the latest releases of those tools require Go 1.25+.
+// GitHub Actions sets GOTOOLCHAIN=local which disables auto-download
+// of newer toolchains, so without this directive the install step
+// fails. setup-go reads the toolchain directive and installs this
+// version directly. The `go` directive above remains the minimum
+// required to use this module.
+toolchain go1.25.10
+
 require (
 	github.com/docker/docker v24.0.6+incompatible
 	github.com/docker/go-connections v0.5.0
