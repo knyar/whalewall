@@ -871,3 +871,145 @@ func TestStaleAddrFlushedFromMapAfterCommit(t *testing.T) {
 	is.True(containsAddr(elements, newAddr))
 	is.True(!containsAddr(elements, oldAddr))
 }
+
+// TestCrossProjectWaitingRuleFiltered reproduces the field-report
+// scenario: two compose projects (prod and dev) each have a server
+// that references "container: redis-1" and a redis-1 service. Without
+// the cross-project filter, prod-server's "redis-1" rule attracts a
+// match against dev-redis (and vice versa), creating a flapping
+// rule in each project's redis chain that the cleanup pass logs as
+// "deleting rule not created by whalewall" every sync interval.
+//
+// With the filter in place, each server's rule should only ever land
+// in its own project's redis chain.
+func TestCrossProjectWaitingRuleFiltered(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	// Helper to build a container with compose labels.
+	makeCompose := func(id, name, project, service, networkName string, addr netip.Addr, rules string) types.ContainerJSON {
+		labels := map[string]string{
+			enabledLabel:        "true",
+			composeProjectLabel: project,
+			composeServiceLabel: service,
+		}
+		if rules != "" {
+			labels[rulesLabel] = rules
+		}
+		return types.ContainerJSON{
+			ContainerJSONBase: &types.ContainerJSONBase{
+				ID:    id,
+				Name:  "/" + name,
+				State: &types.ContainerState{Running: true},
+			},
+			Config: &container.Config{Labels: labels},
+			NetworkSettings: &types.NetworkSettings{
+				Networks: map[string]*network.EndpointSettings{
+					networkName: {
+						Gateway:   gatewayAddr.String(),
+						IPAddress: addr.String(),
+					},
+				},
+			},
+		}
+	}
+
+	// Compose names networks as "${project}_${network}", so a rule
+	// that references `network: default` resolves against either
+	// "default" or "${project}_default". The lookup is by entry in
+	// the container's NetworkSettings.Networks map.
+	const (
+		prodNet = "svitle-api_default"
+		devNet  = "svitle-api-dev_default"
+	)
+	prodRedisAddr := netip.MustParseAddr("172.20.0.2")
+	prodServerAddr := netip.MustParseAddr("172.20.0.3")
+	devRedisAddr := netip.MustParseAddr("172.19.0.2")
+	devServerAddr := netip.MustParseAddr("172.19.0.3")
+
+	// Each "server" container references "container: redis-1" by
+	// service name — the exact pattern that triggered the bug.
+	serverRules := `
+output:
+  - network: default
+    container: redis-1
+    proto: tcp
+    dst_ports:
+      - 6379`
+	prodRedis := makeCompose("prod_redis_id", "svitle-api-redis-1", "svitle-api", "redis-1", prodNet, prodRedisAddr, "")
+	prodServer := makeCompose("prod_server_id", "svitle-api-server-1", "svitle-api", "server", prodNet, prodServerAddr, serverRules)
+	devRedis := makeCompose("dev_redis_id", "svitle-api-dev-redis-1", "svitle-api-dev", "redis-1", devNet, devRedisAddr, "")
+	devServer := makeCompose("dev_server_id", "svitle-api-dev-server-1", "svitle-api-dev", "server", devNet, devServerAddr, serverRules)
+
+	dockerCli.containers = append(dockerCli.containers, prodRedis, prodServer, devRedis, devServer)
+	for _, c := range []types.ContainerJSON{prodRedis, prodServer, devRedis, devServer} {
+		is.NoErr(r.createContainerRules(context.Background(), c, true))
+	}
+
+	// Run a periodic re-sync — this is what was logging the warning
+	// in the field, because each pass would observe cross-project
+	// rules left over from the previous pass and delete them, only
+	// for the next pass to re-add them.
+	for _, c := range []types.ContainerJSON{prodRedis, prodServer, devRedis, devServer} {
+		is.NoErr(r.createContainerRules(context.Background(), c, false))
+	}
+
+	// prod-server's chain should reach prod-redis only.
+	prodServerChain := &nftables.Chain{
+		Table: filterTable,
+		Name:  buildChainName("svitle-api-server-1", "prod_server_id"),
+	}
+	nfc, err := r.newFirewallClient()
+	is.NoErr(err)
+	prodServerRules, err := nfc.GetRules(filterTable, prodServerChain)
+	is.NoErr(err)
+	assertRuleDoesNotMatchAddr(t, prodServerRules, devRedisAddr)
+
+	// dev-server's chain should reach dev-redis only.
+	devServerChain := &nftables.Chain{
+		Table: filterTable,
+		Name:  buildChainName("svitle-api-dev-server-1", "dev_server_id"),
+	}
+	devServerRules, err := nfc.GetRules(filterTable, devServerChain)
+	is.NoErr(err)
+	assertRuleDoesNotMatchAddr(t, devServerRules, prodRedisAddr)
+
+	// prod-redis's chain shouldn't carry an est rule for dev-server.
+	prodRedisChain := &nftables.Chain{
+		Table: filterTable,
+		Name:  buildChainName("svitle-api-redis-1", "prod_redis_id"),
+	}
+	prodRedisRules, err := nfc.GetRules(filterTable, prodRedisChain)
+	is.NoErr(err)
+	assertRuleDoesNotMatchAddr(t, prodRedisRules, devServerAddr)
+
+	// dev-redis's chain shouldn't carry an est rule for prod-server.
+	devRedisChain := &nftables.Chain{
+		Table: filterTable,
+		Name:  buildChainName("svitle-api-dev-redis-1", "dev_redis_id"),
+	}
+	devRedisRules, err := nfc.GetRules(filterTable, devRedisChain)
+	is.NoErr(err)
+	assertRuleDoesNotMatchAddr(t, devRedisRules, prodServerAddr)
+}
+
+// assertRuleDoesNotMatchAddr fails the test if any rule in the slice
+// references the given addr in its saddr or daddr comparison. Used
+// to assert that cross-project rules didn't leak into a chain.
+func assertRuleDoesNotMatchAddr(t *testing.T, rules []*nftables.Rule, addr netip.Addr) {
+	t.Helper()
+	target := ref(addr.As4())[:]
+	for i, rule := range rules {
+		for _, e := range rule.Exprs {
+			cmp, ok := e.(*expr.Cmp)
+			if !ok {
+				continue
+			}
+			if bytes.Equal(cmp.Data, target) {
+				t.Errorf("rule %d unexpectedly references %s: %+v", i, addr, rule)
+			}
+		}
+	}
+}
