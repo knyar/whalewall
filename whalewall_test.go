@@ -417,6 +417,61 @@ func TestRuleCreation(t *testing.T) {
 			},
 		},
 		{
+			// Regression test: a container with whalewall.enabled=true
+			// but an invalid rules YAML must still get the default
+			// drop-all chain. Otherwise a config typo would silently
+			// leave the container unfirewalled.
+			name: "invalid rules YAML falls back to deny all",
+			containers: []types.ContainerJSON{
+				{
+					ContainerJSONBase: &types.ContainerJSONBase{
+						ID:   cont1ID,
+						Name: "/" + cont1Name,
+					},
+					Config: &container.Config{
+						Labels: map[string]string{
+							enabledLabel: "true",
+							// "output" is misindented under "mapped_ports"
+							// instead of at the top level, which yaml.v3
+							// with KnownFields(true) rejects as an unknown
+							// field.
+							rulesLabel: `
+mapped_ports:
+  external:
+    allow: true
+    ips:
+      - 172.16.100.12/32
+  output:
+  - container: "vlogs-vlogs-1"
+    network: vlogs_shared`,
+						},
+					},
+					NetworkSettings: &types.NetworkSettings{
+						Networks: map[string]*network.EndpointSettings{
+							"default": {
+								Gateway:   gatewayAddr.String(),
+								IPAddress: cont1Addr.String(),
+							},
+						},
+					},
+				},
+			},
+			expectedRules: map[*nftables.Chain][]*nftables.Rule{
+				{
+					Name:  buildChainName(cont1Name, cont1ID),
+					Table: filterTable,
+				}: {
+					createDropRule(
+						&nftables.Chain{
+							Name:  buildChainName(cont1Name, cont1ID),
+							Table: filterTable,
+						},
+						cont1ID,
+					),
+				},
+			},
+		},
+		{
 			name: "allow HTTPS outbound",
 			containers: []types.ContainerJSON{
 				{

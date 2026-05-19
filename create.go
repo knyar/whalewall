@@ -151,10 +151,17 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		dec := yaml.NewDecoder(strings.NewReader(cfg))
 		dec.KnownFields(true)
 		if err := dec.Decode(&rulesCfg); err != nil {
-			return fmt.Errorf("error parsing rules: %w", err)
-		}
-		if err := validateConfig(rulesCfg); err != nil {
-			return fmt.Errorf("error validating rules: %w", err)
+			// Fail closed: a parse error must not skip rule
+			// creation, otherwise the container would be left
+			// unfirewalled. Treat the config as absent so the
+			// default drop-all chain is still installed.
+			logger.Error("error parsing rules, container will deny all traffic", zap.Error(err))
+			rulesCfg = config{}
+			configExists = false
+		} else if err := validateConfig(rulesCfg); err != nil {
+			logger.Error("error validating rules, container will deny all traffic", zap.Error(err))
+			rulesCfg = config{}
+			configExists = false
 		}
 	}
 
