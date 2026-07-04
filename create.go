@@ -105,14 +105,19 @@ func (s *setRecordingClient) AddSet(set *nftables.Set, vals []nftables.SetElemen
 
 // createRules adds nftables rules for started containers.
 func (r *RuleManager) createRules(ctx context.Context) {
-	for c := range r.createCh {
-		if err := r.createContainerRules(ctx, c.container, c.isNew); err != nil {
-			r.logger.Error(
-				"error creating rules",
-				zap.String("container.id", c.container.ID[:12]),
-				zap.String("container.name", stripName(c.container.Name)),
-				zap.Error(err),
-			)
+	for {
+		select {
+		case c := <-r.createCh:
+			if err := r.createContainerRules(ctx, c.container, c.isNew); err != nil {
+				r.logger.Error(
+					"error creating rules",
+					zap.String("container.id", c.container.ID[:12]),
+					zap.String("container.name", stripName(c.container.Name)),
+					zap.Error(err),
+				)
+			}
+		case <-r.stopping:
+			return
 		}
 	}
 }
@@ -151,10 +156,17 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		dec := yaml.NewDecoder(strings.NewReader(cfg))
 		dec.KnownFields(true)
 		if err := dec.Decode(&rulesCfg); err != nil {
-			return fmt.Errorf("error parsing rules: %w", err)
-		}
-		if err := validateConfig(rulesCfg); err != nil {
-			return fmt.Errorf("error validating rules: %w", err)
+			// Fail closed: a parse error must not skip rule
+			// creation, otherwise the container would be left
+			// unfirewalled. Treat the config as absent so the
+			// default drop-all chain is still installed.
+			logger.Error("error parsing rules, container will deny all traffic", zap.Error(err))
+			rulesCfg = config{}
+			configExists = false
+		} else if err := validateConfig(rulesCfg); err != nil {
+			logger.Error("error validating rules, container will deny all traffic", zap.Error(err))
+			rulesCfg = config{}
+			configExists = false
 		}
 	}
 

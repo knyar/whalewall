@@ -417,6 +417,61 @@ func TestRuleCreation(t *testing.T) {
 			},
 		},
 		{
+			// Regression test: a container with whalewall.enabled=true
+			// but an invalid rules YAML must still get the default
+			// drop-all chain. Otherwise a config typo would silently
+			// leave the container unfirewalled.
+			name: "invalid rules YAML falls back to deny all",
+			containers: []types.ContainerJSON{
+				{
+					ContainerJSONBase: &types.ContainerJSONBase{
+						ID:   cont1ID,
+						Name: "/" + cont1Name,
+					},
+					Config: &container.Config{
+						Labels: map[string]string{
+							enabledLabel: "true",
+							// "output" is misindented under "mapped_ports"
+							// instead of at the top level, which yaml.v3
+							// with KnownFields(true) rejects as an unknown
+							// field.
+							rulesLabel: `
+mapped_ports:
+  external:
+    allow: true
+    ips:
+      - 172.16.100.12/32
+  output:
+  - container: "vlogs-vlogs-1"
+    network: vlogs_shared`,
+						},
+					},
+					NetworkSettings: &types.NetworkSettings{
+						Networks: map[string]*network.EndpointSettings{
+							"default": {
+								Gateway:   gatewayAddr.String(),
+								IPAddress: cont1Addr.String(),
+							},
+						},
+					},
+				},
+			},
+			expectedRules: map[*nftables.Chain][]*nftables.Rule{
+				{
+					Name:  buildChainName(cont1Name, cont1ID),
+					Table: filterTable,
+				}: {
+					createDropRule(
+						&nftables.Chain{
+							Name:  buildChainName(cont1Name, cont1ID),
+							Table: filterTable,
+						},
+						cont1ID,
+					),
+				},
+			},
+		},
+		{
 			name: "allow HTTPS outbound",
 			containers: []types.ContainerJSON{
 				{
@@ -1962,8 +2017,12 @@ mapped_ports:
 						),
 						UserData: []byte(cont1ID),
 					},
-					srcJumpRule,
-					dstJumpRule,
+					// copy the shared jump rules so the expectedRules
+					// setup loop (which sets Table on every rule) doesn't
+					// write to package-level variables that parallel
+					// tests read via createBaseRules
+					ref(*srcJumpRule),
+					ref(*dstJumpRule),
 				},
 				{
 					Name:  buildChainName(cont1Name, cont1ID),
@@ -2271,8 +2330,12 @@ mapped_ports:
 						),
 						UserData: []byte(cont1ID),
 					},
-					srcJumpRule,
-					dstJumpRule,
+					// copy the shared jump rules so the expectedRules
+					// setup loop (which sets Table on every rule) doesn't
+					// write to package-level variables that parallel
+					// tests read via createBaseRules
+					ref(*srcJumpRule),
+					ref(*dstJumpRule),
 				},
 				{
 					Name:  buildChainName(cont1Name, cont1ID),
@@ -2783,6 +2846,61 @@ mapped_ports:
 				})
 			}
 		})
+	}
+}
+
+// TestStopTerminates is a regression test for a shutdown deadlock:
+// Stop waited on the createRules/deleteRules goroutines before closing
+// createCh/deleteCh, but those goroutines only exited when the channels
+// were closed, so Stop never returned.
+func TestStopTerminates(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	logger, err := zap.NewDevelopment()
+	is.NoErr(err)
+
+	dbFile := filepath.Join(t.TempDir(), "db.sqlite")
+	r, err := NewRuleManager(context.Background(), logger, dbFile, defaultTimeout)
+	is.NoErr(err)
+
+	dockerCli := newMockDockerClient(nil)
+	r.newDockerClient = func() (dockerClient, error) {
+		return dockerCli, nil
+	}
+
+	firewallCreator := newMockFirewallCreator(logger)
+	mfc := firewallCreator.newMockFirewall()
+	mfc.AddTable(filterTable)
+	mfc.AddChain(&nftables.Chain{
+		Name:  dockerChainName,
+		Table: filterTable,
+		Type:  nftables.ChainTypeFilter,
+	})
+	is.NoErr(mfc.Flush())
+	r.newFirewallClient = func() (firewallClient, error) {
+		return firewallCreator.newMockFirewall(), nil
+	}
+
+	is.NoErr(r.Start(context.Background()))
+
+	// Simulate the Docker event stream breaking with the daemon
+	// unreachable, like when whalewall is signaled to shut down: the
+	// event goroutine fails to reconnect and tries to send on the done
+	// channel that nothing is receiving from. Stop must still return.
+	dockerCli.setPingErr(errors.New("cannot connect to the docker daemon"))
+	dockerCli.streamErrCh <- errors.New("event stream broke")
+	time.Sleep(100 * time.Millisecond)
+
+	stopped := make(chan struct{})
+	go func() {
+		r.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Stop did not return within 30 seconds")
 	}
 }
 

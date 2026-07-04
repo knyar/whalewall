@@ -191,7 +191,14 @@ func (r *RuleManager) Start(ctx context.Context) error {
 				_, err = r.dockerCli.Ping(ctx)
 				if err != nil {
 					r.logger.Error("error connecting to docker daemon", zap.Error(err))
-					r.done <- struct{}{}
+					// guard the send so this goroutine can't block
+					// forever if the manager is stopping and nothing
+					// will ever receive from the done channel
+					select {
+					case r.done <- struct{}{}:
+					case <-r.stopping:
+						return
+					}
 					continue
 				}
 

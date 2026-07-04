@@ -81,6 +81,16 @@ func mainRetCode() int {
 		}
 	}
 
+	// Docker 28+ no longer enables br_netfilter unconditionally. Without
+	// it, traffic between containers on the same bridge network never
+	// traverses iptables/nftables, so whalewall cannot filter it. This
+	// must be checked before landlock restricts file access.
+	if data, err := os.ReadFile("/proc/sys/net/bridge/bridge-nf-call-iptables"); err != nil {
+		logger.Warn("unable to check net.bridge.bridge-nf-call-iptables; if it is not enabled, traffic between containers on the same network will not be filtered", zap.Error(err))
+	} else if strings.TrimSpace(string(data)) != "1" {
+		logger.Warn("net.bridge.bridge-nf-call-iptables is disabled; traffic between containers on the same network will not be filtered. Run 'modprobe br_netfilter' and 'sysctl -w net.bridge.bridge-nf-call-iptables=1' to fix this")
+	}
+
 	// create rule manager and drop unneeded privileges
 	dataDirAbs, err := filepath.Abs(*dataDir)
 	if err != nil {
