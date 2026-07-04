@@ -105,14 +105,19 @@ func (s *setRecordingClient) AddSet(set *nftables.Set, vals []nftables.SetElemen
 
 // createRules adds nftables rules for started containers.
 func (r *RuleManager) createRules(ctx context.Context) {
-	for c := range r.createCh {
-		if err := r.createContainerRules(ctx, c.container, c.isNew); err != nil {
-			r.logger.Error(
-				"error creating rules",
-				zap.String("container.id", c.container.ID[:12]),
-				zap.String("container.name", stripName(c.container.Name)),
-				zap.Error(err),
-			)
+	for {
+		select {
+		case c := <-r.createCh:
+			if err := r.createContainerRules(ctx, c.container, c.isNew); err != nil {
+				r.logger.Error(
+					"error creating rules",
+					zap.String("container.id", c.container.ID[:12]),
+					zap.String("container.name", stripName(c.container.Name)),
+					zap.Error(err),
+				)
+			}
+		case <-r.stopping:
+			return
 		}
 	}
 }

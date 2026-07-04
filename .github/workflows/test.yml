@@ -30,6 +30,15 @@ jobs:
       - name: Cache Go files
         uses: capnspacehook/cache-go@v1
 
+      # Docker 28+ no longer enables br_netfilter unconditionally, so
+      # traffic between containers on the same bridge network bypasses
+      # iptables/nftables unless it is enabled; whalewall requires it
+      # to filter container-to-container traffic
+      - name: Enable bridge netfilter
+        run: |
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+
       # the test is compiled and run as root so that whalewall can
       # interface with nftables, which is a privileged operation
       - run: |
@@ -50,6 +59,12 @@ jobs:
 
       - name: Cache Go files
         uses: capnspacehook/cache-go@v1
+
+      # see the comment on the equivalent race-test step
+      - name: Enable bridge netfilter
+        run: |
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
 
       # run the integration tests but use a binary to create rules
       # to test with landlock and seccomp filters active
@@ -84,6 +99,12 @@ jobs:
 
       - name: Cache Go files
         uses: capnspacehook/cache-go@v1
+
+      # see the comment on the equivalent race-test step
+      - name: Enable bridge netfilter
+        run: |
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
 
       # run the integration tests but use a container to create rules
       # to test with landlock and seccomp filters active

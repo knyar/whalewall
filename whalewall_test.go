@@ -2841,6 +2841,53 @@ mapped_ports:
 	}
 }
 
+// TestStopTerminates is a regression test for a shutdown deadlock:
+// Stop waited on the createRules/deleteRules goroutines before closing
+// createCh/deleteCh, but those goroutines only exited when the channels
+// were closed, so Stop never returned.
+func TestStopTerminates(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	logger, err := zap.NewDevelopment()
+	is.NoErr(err)
+
+	dbFile := filepath.Join(t.TempDir(), "db.sqlite")
+	r, err := NewRuleManager(context.Background(), logger, dbFile, defaultTimeout)
+	is.NoErr(err)
+
+	dockerCli := newMockDockerClient(nil)
+	r.newDockerClient = func() (dockerClient, error) {
+		return dockerCli, nil
+	}
+
+	firewallCreator := newMockFirewallCreator(logger)
+	mfc := firewallCreator.newMockFirewall()
+	mfc.AddTable(filterTable)
+	mfc.AddChain(&nftables.Chain{
+		Name:  dockerChainName,
+		Table: filterTable,
+		Type:  nftables.ChainTypeFilter,
+	})
+	is.NoErr(mfc.Flush())
+	r.newFirewallClient = func() (firewallClient, error) {
+		return firewallCreator.newMockFirewall(), nil
+	}
+
+	is.NoErr(r.Start(context.Background()))
+
+	stopped := make(chan struct{})
+	go func() {
+		r.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Stop did not return within 30 seconds")
+	}
+}
+
 func TestDeletingContainers(t *testing.T) {
 	t.Parallel()
 

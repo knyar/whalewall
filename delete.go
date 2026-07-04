@@ -133,7 +133,14 @@ func (r *RuleManager) cleanupRules(ctx context.Context) error {
 
 // deleteRules removes nftables rules for stopped or killed containers.
 func (r *RuleManager) deleteRules(ctx context.Context) {
-	for id := range r.deleteCh {
+	for {
+		var id string
+		select {
+		case id = <-r.deleteCh:
+		case <-r.stopping:
+			return
+		}
+
 		truncID := id[:12]
 		name, err := r.db.GetContainerName(ctx, id)
 		if err != nil {
