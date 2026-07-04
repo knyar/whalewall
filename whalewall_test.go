@@ -2017,8 +2017,12 @@ mapped_ports:
 						),
 						UserData: []byte(cont1ID),
 					},
-					srcJumpRule,
-					dstJumpRule,
+					// copy the shared jump rules so the expectedRules
+					// setup loop (which sets Table on every rule) doesn't
+					// write to package-level variables that parallel
+					// tests read via createBaseRules
+					ref(*srcJumpRule),
+					ref(*dstJumpRule),
 				},
 				{
 					Name:  buildChainName(cont1Name, cont1ID),
@@ -2326,8 +2330,12 @@ mapped_ports:
 						),
 						UserData: []byte(cont1ID),
 					},
-					srcJumpRule,
-					dstJumpRule,
+					// copy the shared jump rules so the expectedRules
+					// setup loop (which sets Table on every rule) doesn't
+					// write to package-level variables that parallel
+					// tests read via createBaseRules
+					ref(*srcJumpRule),
+					ref(*dstJumpRule),
 				},
 				{
 					Name:  buildChainName(cont1Name, cont1ID),
@@ -2875,6 +2883,14 @@ func TestStopTerminates(t *testing.T) {
 	}
 
 	is.NoErr(r.Start(context.Background()))
+
+	// Simulate the Docker event stream breaking with the daemon
+	// unreachable, like when whalewall is signaled to shut down: the
+	// event goroutine fails to reconnect and tries to send on the done
+	// channel that nothing is receiving from. Stop must still return.
+	dockerCli.setPingErr(errors.New("cannot connect to the docker daemon"))
+	dockerCli.streamErrCh <- errors.New("event stream broke")
+	time.Sleep(100 * time.Millisecond)
 
 	stopped := make(chan struct{})
 	go func() {

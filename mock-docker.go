@@ -21,23 +21,36 @@ type dockerClient interface {
 type mockDockerClient struct {
 	mtx sync.RWMutex
 
-	eventCh    chan events.Message
-	containers []types.ContainerJSON
+	eventCh     chan events.Message
+	streamErrCh chan error
+	pingErr     error
+	containers  []types.ContainerJSON
 }
 
 func newMockDockerClient(containers []types.ContainerJSON) *mockDockerClient {
 	return &mockDockerClient{
-		eventCh:    make(chan events.Message),
-		containers: containers,
+		eventCh:     make(chan events.Message),
+		streamErrCh: make(chan error),
+		containers:  containers,
 	}
 }
 
+func (m *mockDockerClient) setPingErr(err error) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	m.pingErr = err
+}
+
 func (m *mockDockerClient) Ping(_ context.Context) (types.Ping, error) {
-	return types.Ping{}, nil
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	return types.Ping{}, m.pingErr
 }
 
 func (m *mockDockerClient) Events(_ context.Context, _ types.EventsOptions) (<-chan events.Message, <-chan error) {
-	return m.eventCh, nil
+	return m.eventCh, m.streamErrCh
 }
 
 func (m *mockDockerClient) ContainerList(_ context.Context, _ types.ContainerListOptions) ([]types.Container, error) {
