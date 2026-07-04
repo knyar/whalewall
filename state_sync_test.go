@@ -1013,3 +1013,231 @@ func assertRuleDoesNotMatchAddr(t *testing.T, rules []*nftables.Rule, addr netip
 		}
 	}
 }
+
+// TestRecreatedContainerSameName ensures that creating rules for a
+// container succeeds when the database still holds an entry for an
+// older container with the same name. This happens when a container is
+// recreated (e.g. 'docker compose up' after a config change): the die
+// event of the old container and the start event of the new one are
+// processed concurrently, and if the create wins the race the insert
+// used to fail with 'UNIQUE constraint failed: containers.name'.
+func TestRecreatedContainerSameName(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, mfc := setupSyncTest(t)
+
+	makeCont := func(id string, addr netip.Addr) types.ContainerJSON {
+		return types.ContainerJSON{
+			ContainerJSONBase: &types.ContainerJSONBase{
+				ID:    id,
+				Name:  "/" + cont1Name,
+				State: &types.ContainerState{Running: true},
+			},
+			Config: &container.Config{
+				Labels: map[string]string{
+					enabledLabel: "true",
+				},
+			},
+			NetworkSettings: &types.NetworkSettings{
+				Networks: map[string]*network.EndpointSettings{
+					"default": {
+						Gateway:   gatewayAddr.String(),
+						IPAddress: addr.String(),
+					},
+				},
+			},
+		}
+	}
+
+	oldCont := makeCont(cont1ID, cont1Addr)
+	dockerCli.containers = append(dockerCli.containers, oldCont)
+	is.NoErr(r.createContainerRules(context.Background(), oldCont, true))
+
+	// Recreate the container: same name, new ID and IP. The old
+	// container is gone from Docker but its die event hasn't been
+	// processed, so its database entry and rules still exist.
+	const newID = "container_recreated_ID"
+	newCont := makeCont(newID, cont2Addr)
+	dockerCli.mtx.Lock()
+	dockerCli.containers = []types.ContainerJSON{newCont}
+	dockerCli.mtx.Unlock()
+
+	is.NoErr(r.createContainerRules(context.Background(), newCont, true)) // creating rules for recreated container should succeed
+
+	// The old container's state should have been cleaned up.
+	exists, err := r.containerExists(context.Background(), r.db, cont1ID)
+	is.NoErr(err)
+	is.True(!exists) // old container should be removed from DB
+
+	oldChain := &nftables.Chain{Table: filterTable, Name: buildChainName(cont1Name, cont1ID)}
+	_, err = mfc.GetRules(filterTable, oldChain)
+	is.True(errors.Is(err, syscall.ENOENT)) // old container chain should be removed
+
+	// The new container should be fully set up.
+	exists, err = r.containerExists(context.Background(), r.db, newID)
+	is.NoErr(err)
+	is.True(exists) // new container should be in DB
+
+	newChain := &nftables.Chain{Table: filterTable, Name: buildChainName(cont1Name, newID)}
+	rules, err := mfc.GetRules(filterTable, newChain)
+	is.NoErr(err)
+	is.True(len(rules) > 0) // new container chain should have rules
+}
+
+// TestWaitingRuleSrcContainerNoIP ensures that a stored waiting rule
+// whose source container is present in Docker but no longer has an IP
+// on the rule's network (because it is being stopped or recreated) is
+// skipped instead of failing rule creation for the destination
+// container with 'ParseAddr(""): unable to parse IP'.
+func TestWaitingRuleSrcContainerNoIP(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	srcCont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:    cont1ID,
+			Name:  "/" + cont1Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{
+				enabledLabel: "true",
+				rulesLabel: `
+output:
+  - network: default
+    container: ` + cont2Name + `
+    proto: tcp
+    dst_ports:
+      - 8000`,
+			},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont1Addr.String(),
+				},
+			},
+		},
+	}
+	// The destination container isn't started yet, so a waiting rule
+	// will be stored for it.
+	dockerCli.containers = append(dockerCli.containers, srcCont)
+	is.NoErr(r.createContainerRules(context.Background(), srcCont, true))
+
+	dstCont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:    cont2ID,
+			Name:  "/" + cont2Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{
+				enabledLabel: "true",
+			},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont2Addr.String(),
+				},
+			},
+		},
+	}
+	// Simulate the source container being torn down while the
+	// destination container starts: it still inspects successfully but
+	// has been disconnected from the network.
+	dockerCli.mtx.Lock()
+	dockerCli.containers[0].NetworkSettings.Networks["default"].IPAddress = ""
+	dockerCli.containers = append(dockerCli.containers, dstCont)
+	dockerCli.mtx.Unlock()
+
+	is.NoErr(r.createContainerRules(context.Background(), dstCont, true)) // rule creation should skip the unusable waiting rule
+
+	exists, err := r.containerExists(context.Background(), r.db, cont2ID)
+	is.NoErr(err)
+	is.True(exists) // destination container should be in DB
+}
+
+// TestOutputRuleDstContainerNoIP ensures that an output rule whose
+// destination container is in the database but no longer has an IP on
+// the rule's network (because it is being stopped or recreated) is
+// deferred as a waiting rule instead of failing rule creation for the
+// source container.
+func TestOutputRuleDstContainerNoIP(t *testing.T) {
+	t.Parallel()
+
+	is := is.New(t)
+	r, dockerCli, _ := setupSyncTest(t)
+
+	dstCont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:    cont2ID,
+			Name:  "/" + cont2Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{
+				enabledLabel: "true",
+			},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont2Addr.String(),
+				},
+			},
+		},
+	}
+	dockerCli.containers = append(dockerCli.containers, dstCont)
+	is.NoErr(r.createContainerRules(context.Background(), dstCont, true))
+
+	// Simulate the destination container being torn down: it is still
+	// in the database and inspects successfully, but has been
+	// disconnected from the network.
+	dockerCli.mtx.Lock()
+	dockerCli.containers[0].NetworkSettings.Networks["default"].IPAddress = ""
+	dockerCli.mtx.Unlock()
+
+	srcCont := types.ContainerJSON{
+		ContainerJSONBase: &types.ContainerJSONBase{
+			ID:    cont1ID,
+			Name:  "/" + cont1Name,
+			State: &types.ContainerState{Running: true},
+		},
+		Config: &container.Config{
+			Labels: map[string]string{
+				enabledLabel: "true",
+				rulesLabel: `
+output:
+  - network: default
+    container: ` + cont2Name + `
+    proto: tcp
+    dst_ports:
+      - 8000`,
+			},
+		},
+		NetworkSettings: &types.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"default": {
+					Gateway:   gatewayAddr.String(),
+					IPAddress: cont1Addr.String(),
+				},
+			},
+		},
+	}
+	dockerCli.mtx.Lock()
+	dockerCli.containers = append(dockerCli.containers, srcCont)
+	dockerCli.mtx.Unlock()
+
+	is.NoErr(r.createContainerRules(context.Background(), srcCont, true)) // rule creation should defer the rule instead of failing
+
+	exists, err := r.containerExists(context.Background(), r.db, cont1ID)
+	is.NoErr(err)
+	is.True(exists) // source container should be in DB
+}

@@ -168,6 +168,20 @@ func (r *RuleManager) createContainerRules(ctx context.Context, container types.
 		addrs[netName] = ref(addr.As4())[:]
 	}
 
+	// If the container was recreated with the same name (e.g. by
+	// 'docker compose up' after a config change), the start event of
+	// the new container races the die event of the old one, which is
+	// processed on a separate goroutine. If the old container's
+	// database entry still exists, adding the new container to the
+	// database below would violate the UNIQUE constraint on container
+	// names — clean up the old container's state before creating any
+	// state for the new container.
+	if isNew {
+		if err := r.cleanupStaleContainer(ctx, logger, container.ID, contName); err != nil {
+			return fmt.Errorf("error cleaning up stale container %q: %w", contName, err)
+		}
+	}
+
 	rawNfc, err := r.newFirewallClient()
 	if err != nil {
 		return fmt.Errorf("error creating netlink connection: %w", err)
@@ -538,6 +552,52 @@ func (r *RuleManager) applyAddrMapUpdates(logger *zap.Logger, nfc firewallClient
 	return nil
 }
 
+// cleanupStaleContainer deletes the rules and database state of an old
+// container that has the same name as the given container, if one
+// exists. When a container is recreated with the same name, Docker
+// emits a die event for the old container and a start event for the
+// new one; those events are handled concurrently, so rule creation for
+// the new container can run before the old container's state has been
+// deleted, and inserting the new container into the database would
+// fail the UNIQUE constraint on container names. Docker enforces
+// unique container names, so the old container is verified to be gone
+// (or at least not running) before any of its state is deleted.
+func (r *RuleManager) cleanupStaleContainer(ctx context.Context, logger *zap.Logger, id, name string) error {
+	staleID, err := r.db.GetContainerID(ctx, name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		// The lookup is opportunistic, don't let a transient database
+		// error (like SQLITE_BUSY under heavy contention) fail rule
+		// creation. If a name conflict really does exist, adding the
+		// container to the database will fail and rule creation will
+		// be retried by the periodic sync.
+		logger.Warn("error checking database for stale container", zap.Error(err))
+		return nil
+	}
+	if staleID == id {
+		return nil
+	}
+
+	c, err := r.dockerCli.ContainerInspect(ctx, staleID)
+	if err != nil && !client.IsErrNotFound(err) {
+		return fmt.Errorf("error inspecting container %s: %w", staleID[:12], err)
+	}
+	if err == nil && c.State != nil && c.State.Running {
+		// Shouldn't be possible, Docker enforces unique names among
+		// all containers; refuse to delete state of a running container.
+		return fmt.Errorf("container %q already exists with ID %s and is running", name, staleID[:12])
+	}
+
+	logger.Info("deleting rules of recreated container", zap.String("stale.id", staleID[:12]))
+	if err := r.deleteContainerRules(ctx, staleID, name); err != nil {
+		return fmt.Errorf("error deleting rules of stale container %s: %w", staleID[:12], err)
+	}
+
+	return nil
+}
+
 // stripName removes the leading "/" from a container name if necessary.
 func stripName(name string) string {
 	if len(name) > 0 && name[0] == '/' {
@@ -624,6 +684,14 @@ func (r *RuleManager) populateOutputRules(ctx context.Context, tx database.TX, c
 					return fmt.Errorf("error querying container %s from database: %w", cont.ID[:12], err)
 				}
 				if !exists {
+					break
+				}
+				if dstNetwork.IPAddress == "" {
+					// The container is in the database but has no IP
+					// on the network, most likely because it is being
+					// stopped or recreated. Treat it as unprocessed:
+					// the rule is saved as a waiting rule below and
+					// will be created when the container starts again.
 					break
 				}
 				estConts[cont.ID] = struct{}{}
@@ -1140,18 +1208,26 @@ func (r *RuleManager) createWaitingContainerRules(ctx context.Context, nfc firew
 			// and now; skip this rule.
 			continue
 		}
+		srcName := stripName(srcCont.Name)
 		srcProject := srcCont.Config.Labels[composeProjectLabel]
 		srcNetName, srcNetwork, ok := findNetwork(ruleCfg.Network, srcProject, srcCont.NetworkSettings.Networks)
-		if !ok {
-			return nil, fmt.Errorf(
-				"network %q not found for container %q",
-				ruleCfg.Network,
-				ruleCfg.Container,
+		if !ok || srcNetwork.IPAddress == "" {
+			// The src container exists but has no IP on the network,
+			// most likely because it is being stopped or recreated and
+			// was already disconnected. Treat it like a vanished
+			// container and skip the rule; if the src container comes
+			// back, the rule will be recreated when it is processed.
+			logger.Warn(
+				"skipping waiting rule: source container is not connected to network",
+				zap.String("src.id", waitingRule.SrcContainerID[:12]),
+				zap.String("src.name", srcName),
+				zap.String("network", ruleCfg.Network),
 			)
+			continue
 		}
 		srcAddr, err := netip.ParseAddr(srcNetwork.IPAddress)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing IP of container %q from network %q: %w", ruleCfg.Container, srcNetName, err)
+			return nil, fmt.Errorf("error parsing IP of container %q from network %q: %w", srcName, srcNetName, err)
 		}
 
 		// find destination container IP (this container)
